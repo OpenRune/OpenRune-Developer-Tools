@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>OpenRune DeveloperTools — MCP Activity</title>
+<style>
+	:root {
+		--bg: #0d0f12;
+		--panel: #16191d;
+		--panel2: #1c2026;
+		--border: #262b32;
+		--text: #e2e5e9;
+		--muted: #7d8590;
+		--accent: #58a6ff;
+		--violet: #bc8cff;
+		--amber: #e3b341;
+		--cyan: #39c5cf;
+		--error: #f85149;
+		--ok: #3fb950;
+	}
+	* { box-sizing: border-box; }
+	html, body { margin: 0; height: 100%; }
+	body {
+		background: var(--bg);
+		color: var(--text);
+		font: 13px/1.55 "Segoe UI", system-ui, -apple-system, sans-serif;
+		display: flex;
+		flex-direction: column;
+	}
+
+	/* ---------- header ---------- */
+	header {
+		position: sticky; top: 0; z-index: 20;
+		background: linear-gradient(180deg, #191d23 0%, #14171b 100%);
+		border-bottom: 1px solid var(--border);
+		padding: 0 20px;
+	}
+	.bar {
+		display: flex; align-items: center; gap: 14px;
+		height: 52px;
+	}
+	.logo {
+		display: flex; align-items: center; gap: 10px;
+		font-size: 15px; font-weight: 650; letter-spacing: .2px;
+		white-space: nowrap;
+	}
+	.logo .dot {
+		width: 10px; height: 10px; border-radius: 50%;
+		background: var(--muted);
+		box-shadow: 0 0 0 3px rgba(125,133,144,.15);
+	}
+	.logo .dot.live {
+		background: var(--ok);
+		box-shadow: 0 0 0 3px rgba(63,185,80,.18);
+		animation: pulse 2s infinite;
+	}
+	@keyframes pulse {
+		0%, 100% { box-shadow: 0 0 0 3px rgba(63,185,80,.18); }
+		50% { box-shadow: 0 0 0 6px rgba(63,185,80,.05); }
+	}
+	.logo small { color: var(--muted); font-weight: 400; font-size: 11px; }
+	.spacer { flex: 1; }
+
+	.stats { display: flex; gap: 8px; }
+	.stat {
+		background: var(--panel2);
+		border: 1px solid var(--border);
+		border-radius: 6px;
+		padding: 3px 10px;
+		font-size: 11px;
+		color: var(--muted);
+		white-space: nowrap;
+	}
+	.stat b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+	.stat b.err { color: var(--error); }
+
+	.controls {
+		display: flex; align-items: center; gap: 10px;
+		padding: 8px 0 10px;
+	}
+	select {
+		background: var(--panel2);
+		border: 1px solid var(--border);
+		border-radius: 6px;
+		color: var(--text);
+		padding: 5px 10px;
+		width: 220px;
+		font-size: 12px;
+		outline: none;
+		cursor: pointer;
+	}
+	select:focus { border-color: var(--accent); }
+	.toggle {
+		display: flex; align-items: center; gap: 5px;
+		color: var(--muted); font-size: 12px;
+		user-select: none; cursor: pointer;
+	}
+	.toggle input { accent-color: var(--accent); }
+	button {
+		background: var(--panel2);
+		color: var(--text);
+		border: 1px solid var(--border);
+		border-radius: 6px;
+		padding: 5px 14px;
+		cursor: pointer;
+		font-size: 12px;
+	}
+	button:hover { border-color: var(--accent); }
+
+	/* ---------- feed ---------- */
+	#feed {
+		flex: 1;
+		padding: 16px 20px 40px;
+		display: flex; flex-direction: column; gap: 10px;
+		max-width: 1100px;
+		width: 100%;
+		margin: 0 auto;
+	}
+	.empty {
+		color: var(--muted);
+		text-align: center;
+		padding: 80px 0;
+	}
+	.empty .big { font-size: 30px; margin-bottom: 10px; opacity: .5; }
+
+	.entry {
+		background: var(--panel);
+		border: 1px solid var(--border);
+		border-left: 3px solid var(--muted);
+		border-radius: 8px;
+		padding: 10px 14px;
+		animation: slidein .18s ease-out;
+	}
+	@keyframes slidein {
+		from { opacity: 0; transform: translateY(6px); }
+		to { opacity: 1; transform: none; }
+	}
+	.entry.cat-view { border-left-color: var(--cyan); }
+	.entry.cat-shot { border-left-color: var(--violet); }
+	.entry.cat-act  { border-left-color: var(--amber); }
+	.entry.error    { border-left-color: var(--error); background: #1c1416; }
+
+	.entry .head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+	.badge {
+		font: 600 12px Consolas, monospace;
+		padding: 2px 9px;
+		border-radius: 20px;
+		background: rgba(125,133,144,.12);
+		color: var(--muted);
+	}
+	.cat-view .badge { background: rgba(57,197,207,.12); color: var(--cyan); }
+	.cat-shot .badge { background: rgba(188,140,255,.12); color: var(--violet); }
+	.cat-act  .badge { background: rgba(227,179,65,.12);  color: var(--amber); }
+	.error    .badge { background: rgba(248,81,73,.14);   color: var(--error); }
+
+	.meta { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+	.dur {
+		margin-left: auto;
+		font-size: 11px; color: var(--muted);
+		font-variant-numeric: tabular-nums;
+	}
+	.dur.slow { color: var(--amber); }
+
+	.chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+	.chip {
+		font: 11px Consolas, monospace;
+		background: var(--panel2);
+		border: 1px solid var(--border);
+		border-radius: 4px;
+		padding: 1px 7px;
+		color: #b8c7a8;
+	}
+	.chip b { color: var(--muted); font-weight: 400; }
+
+	details.result { margin-top: 8px; }
+	details.result summary {
+		cursor: pointer;
+		color: var(--muted);
+		font-size: 11px;
+		user-select: none;
+		list-style: none;
+	}
+	details.result summary::before { content: "▸ "; }
+	details.result[open] summary::before { content: "▾ "; }
+	details.result summary:hover { color: var(--text); }
+	.json {
+		font: 12px/1.5 Consolas, monospace;
+		white-space: pre-wrap;
+		word-break: break-word;
+		background: #0f1216;
+		border: 1px solid var(--border);
+		border-radius: 6px;
+		padding: 8px 10px;
+		margin-top: 6px;
+		max-height: 340px;
+		overflow: auto;
+		color: #c9d1d9;
+	}
+	.error .json, .json.error-text { color: var(--error); }
+	.oneline {
+		margin-top: 7px;
+		font: 12px Consolas, monospace;
+		color: #9fb0c0;
+	}
+	.error .oneline { color: var(--error); }
+
+	.shots { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+	.shots img {
+		max-width: 300px; max-height: 200px;
+		border: 1px solid var(--border);
+		border-radius: 6px;
+		cursor: zoom-in;
+		background: #000;
+	}
+	.shots img:hover { border-color: var(--violet); }
+
+	/* ---------- lightbox ---------- */
+	#lightbox {
+		display: none;
+		position: fixed; inset: 0; z-index: 50;
+		background: rgba(5,6,8,.92);
+		align-items: center; justify-content: center;
+		cursor: zoom-out;
+		padding: 30px;
+	}
+	#lightbox.open { display: flex; }
+	#lightbox img {
+		max-width: 100%; max-height: 100%;
+		border-radius: 6px;
+		box-shadow: 0 8px 40px rgba(0,0,0,.6);
+	}
+</style>
+</head>
+<body>
+<header>
+	<div class="bar">
+		<div class="logo">
+			<span class="dot" id="dot"></span>
+			OpenRune DeveloperTools
+			<small id="statustext">connecting…</small>
+		</div>
+		<span class="spacer"></span>
+		<div class="stats">
+			<span class="stat">calls <b id="s-calls">0</b></span>
+			<span class="stat">errors <b class="err" id="s-errors">0</b></span>
+			<span class="stat">avg <b id="s-avg">0</b> ms</span>
+		</div>
+	</div>
+	<div class="controls">
+		<select id="filter"><option value="">all tools</option></select>
+		<label class="toggle"><input type="checkbox" id="errorsonly"> errors only</label>
+		<label class="toggle"><input type="checkbox" id="autoscroll" checked> follow</label>
+		<span class="spacer"></span>
+		<button id="pause">Pause</button>
+		<button id="clear">Clear</button>
+	</div>
+</header>
+
+<div id="feed">
+	<div class="empty" id="empty">
+		<div class="big">⌖</div>
+		Waiting for AI tool calls…<br>
+		<small>connect with: <code>claude mcp add --transport http flux http://127.0.0.1:7780/mcp</code></small>
+	</div>
+</div>
+
+<div id="lightbox"><img id="lightimg" alt=""></div>
+
+<script>
+"use strict";
+const feed = document.getElementById("feed");
+const empty = document.getElementById("empty");
+const dot = document.getElementById("dot");
+const statusText = document.getElementById("statustext");
+const lightbox = document.getElementById("lightbox");
+const lightimg = document.getElementById("lightimg");
+const MAX_NODES = 200;
+
+let after = 0;
+let paused = false;
+let stats = { calls: 0, errors: 0, totalMs: 0 };
+
+const ACT_TOOLS = /^(click|drag|hover|press|type|enter|walk|pickup|interact|select|continue)/;
+const SHOT_TOOLS = /^screenshot/;
+
+document.getElementById("clear").onclick = () => {
+	feed.querySelectorAll(".entry").forEach(e => e.remove());
+};
+document.getElementById("pause").onclick = function () {
+	paused = !paused;
+	this.textContent = paused ? "Resume" : "Pause";
+};
+document.getElementById("filter").onchange = applyFilter;
+
+const knownTools = new Set();
+function registerTool(name) {
+	if (knownTools.has(name)) return;
+	knownTools.add(name);
+	const select = document.getElementById("filter");
+	const opt = document.createElement("option");
+	opt.value = name;
+	opt.textContent = name;
+	// keep options alphabetical after the "all tools" entry
+	const options = [...select.options].slice(1);
+	const before = options.find(o => o.value > name);
+	select.insertBefore(opt, before || null);
+}
+document.getElementById("errorsonly").onchange = applyFilter;
+lightbox.onclick = () => lightbox.classList.remove("open");
+document.addEventListener("keydown", e => {
+	if (e.key === "Escape") lightbox.classList.remove("open");
+});
+
+function applyFilter() {
+	const tool = document.getElementById("filter").value;
+	const errOnly = document.getElementById("errorsonly").checked;
+	feed.querySelectorAll(".entry").forEach(el => {
+		const show = (!tool || el.dataset.tool === tool)
+			&& (!errOnly || el.classList.contains("error"));
+		el.style.display = show ? "" : "none";
+	});
+}
+
+function category(entry) {
+	if (entry.isError) return "error";
+	if (SHOT_TOOLS.test(entry.tool)) return "cat-shot";
+	if (ACT_TOOLS.test(entry.tool)) return "cat-act";
+	return "cat-view";
+}
+
+function fmtTime(iso) {
+	try { return new Date(iso).toLocaleTimeString([], { hour12: false }); }
+	catch (e) { return iso; }
+}
+
+function render(entry) {
+	if (empty.parentNode) empty.remove();
+
+	stats.calls++;
+	if (entry.isError) stats.errors++;
+	stats.totalMs += entry.durationMs;
+	document.getElementById("s-calls").textContent = stats.calls;
+	document.getElementById("s-errors").textContent = stats.errors;
+	document.getElementById("s-avg").textContent = Math.round(stats.totalMs / stats.calls);
+
+	const div = document.createElement("div");
+	div.className = "entry " + category(entry);
+	div.dataset.tool = entry.tool;
+	registerTool(entry.tool);
+
+	const head = document.createElement("div");
+	head.className = "head";
+	const badge = document.createElement("span");
+	badge.className = "badge";
+	badge.textContent = entry.tool;
+	const meta = document.createElement("span");
+	meta.className = "meta";
+	meta.textContent = "#" + entry.id + " · " + fmtTime(entry.time);
+	const dur = document.createElement("span");
+	dur.className = "dur" + (entry.durationMs > 1000 ? " slow" : "");
+	dur.textContent = entry.durationMs + " ms";
+	head.append(badge, meta, dur);
+	div.append(head);
+
+	const argKeys = entry.args ? Object.keys(entry.args) : [];
+	if (argKeys.length) {
+		const chips = document.createElement("div");
+		chips.className = "chips";
+		for (const key of argKeys) {
+			const chip = document.createElement("span");
+			chip.className = "chip";
+			const b = document.createElement("b");
+			b.textContent = key + "=";
+			chip.append(b, String(JSON.stringify(entry.args[key])).replace(/^"|"$/g, ""));
+			chips.append(chip);
+		}
+		div.append(chips);
+	}
+
+	for (const text of entry.texts || []) {
+		let pretty = null;
+		try { pretty = JSON.stringify(JSON.parse(text), null, 2); } catch (e) { /* plain */ }
+		if (pretty !== null && pretty.length > 80) {
+			const details = document.createElement("details");
+			details.className = "result";
+			const summary = document.createElement("summary");
+			summary.textContent = "result (" + pretty.split("\n").length + " lines)";
+			const pre = document.createElement("div");
+			pre.className = "json";
+			pre.textContent = pretty;
+			details.append(summary, pre);
+			div.append(details);
+		} else {
+			const line = document.createElement("div");
+			line.className = "oneline";
+			line.textContent = pretty !== null ? pretty : text;
+			div.append(line);
+		}
+	}
+
+	if ((entry.images || []).length) {
+		const shots = document.createElement("div");
+		shots.className = "shots";
+		for (const b64 of entry.images) {
+			const img = document.createElement("img");
+			img.src = "data:image/png;base64," + b64;
+			img.onclick = () => {
+				lightimg.src = img.src;
+				lightbox.classList.add("open");
+			};
+			shots.append(img);
+		}
+		div.append(shots);
+	}
+
+	feed.append(div);
+	while (feed.querySelectorAll(".entry").length > MAX_NODES) {
+		feed.querySelector(".entry").remove();
+	}
+
+	const tool = document.getElementById("filter").value;
+	const errOnly = document.getElementById("errorsonly").checked;
+	if ((tool && div.dataset.tool !== tool) || (errOnly && !entry.isError)) {
+		div.style.display = "none";
+	} else if (document.getElementById("autoscroll").checked) {
+		div.scrollIntoView({ block: "end", behavior: "smooth" });
+	}
+}
+
+async function poll() {
+	try {
+		if (!paused) {
+			const resp = await fetch("/log?after=" + after);
+			const data = await resp.json();
+			for (const entry of data.entries) render(entry);
+			after = data.last;
+		}
+		dot.classList.add("live");
+		statusText.textContent = paused ? "paused" : "live";
+	} catch (e) {
+		dot.classList.remove("live");
+		statusText.textContent = "disconnected — is the plugin on?";
+	}
+	setTimeout(poll, 800);
+}
+poll();
+</script>
+</body>
+</html>

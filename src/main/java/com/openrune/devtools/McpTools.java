@@ -1,0 +1,2827 @@
+/*
+ * Copyright (c) 2026, Mark7625
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package com.openrune.devtools;
+
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import java.awt.Canvas;
+import java.awt.Graphics2D;
+import java.awt.Image;
+import java.awt.Point;
+import java.awt.Polygon;
+import java.awt.Rectangle;
+import java.awt.Shape;
+import java.awt.event.InputEvent;
+import java.awt.event.KeyEvent;
+import java.awt.event.MouseEvent;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.Comparator;
+import java.util.Deque;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
+import javax.imageio.ImageIO;
+import javax.swing.SwingUtilities;
+import net.runelite.api.Actor;
+import net.runelite.api.ActorSpotAnim;
+import net.runelite.api.Client;
+import net.runelite.api.DecorativeObject;
+import net.runelite.api.GameObject;
+import net.runelite.api.GroundObject;
+import net.runelite.api.Item;
+import net.runelite.api.ItemComposition;
+import net.runelite.api.ItemContainer;
+import net.runelite.api.MenuAction;
+import net.runelite.api.MenuEntry;
+import net.runelite.api.NPC;
+import net.runelite.api.NPCComposition;
+import net.runelite.api.ObjectComposition;
+import net.runelite.api.Perspective;
+import net.runelite.api.Player;
+import net.runelite.api.Projectile;
+import net.runelite.api.Scene;
+import net.runelite.api.Skill;
+import net.runelite.api.Tile;
+import net.runelite.api.TileItem;
+import net.runelite.api.TileObject;
+import net.runelite.api.WallObject;
+import net.runelite.api.gameval.InterfaceID;
+import net.runelite.api.coords.LocalPoint;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.widgets.Widget;
+import net.runelite.api.widgets.WidgetUtil;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.ui.DrawManager;
+
+/**
+ * Implements the MCP tools exposed by {@link OpenRuneDevToolsPlugin}: screenshots,
+ * widget inspection by packed component id, and mouse control on the game canvas.
+ */
+class McpTools
+{
+	private static final long CLIENT_THREAD_TIMEOUT_MS = 5_000L;
+	private static final long FRAME_TIMEOUT_MS = 5_000L;
+	private static final int MAX_COMPONENTS_PER_INTERFACE = 2048;
+	private static final int COMPONENT_SCAN_GAP = 64;
+
+	private final Client client;
+	private final ClientThread clientThread;
+	private final DrawManager drawManager;
+	private final McpEventRecorder recorder;
+	private final Map<String, ToolDef> tools = new LinkedHashMap<>();
+
+	McpTools(Client client, ClientThread clientThread, DrawManager drawManager, McpEventRecorder recorder)
+	{
+		this.client = client;
+		this.clientThread = clientThread;
+		this.drawManager = drawManager;
+		this.recorder = recorder;
+		registerTools();
+	}
+
+	/** Produces the final MCP result object for one tool call. */
+	@FunctionalInterface
+	private interface ToolHandler
+	{
+		JsonObject run(JsonObject args) throws Exception;
+	}
+
+	private static final class ToolDef
+	{
+		final String description;
+		final JsonObject inputSchema;
+		final ToolHandler handler;
+
+		ToolDef(String description, JsonObject inputSchema, ToolHandler handler)
+		{
+			this.description = description;
+			this.inputSchema = inputSchema;
+			this.handler = handler;
+		}
+	}
+
+	JsonArray listTools()
+	{
+		JsonArray arr = new JsonArray();
+		tools.forEach((name, def) -> arr.add(tool(name, def.description, def.inputSchema)));
+		return arr;
+	}
+
+	JsonObject callTool(String name, JsonObject args) throws Exception
+	{
+		ToolDef def = tools.get(name);
+		if (def == null)
+		{
+			throw new IllegalArgumentException("Unknown tool: " + name);
+		}
+		return def.handler.run(args);
+	}
+
+	private void register(String name, String description, JsonObject inputSchema, ToolHandler handler)
+	{
+		tools.put(name, new ToolDef(description, inputSchema, handler));
+	}
+
+	private void registerTools()
+	{
+		// ---- inspection ----
+
+		register("screenshot",
+			"Capture a PNG of the game canvas. No args = full canvas. Crop with componentId (single widget), interfaceId (whole interface, tight), or x/y/width/height (region).",
+			schema(props(
+				"componentId", "integer", "Packed component id to crop to (interfaceId << 16 | childId)",
+				"childIndex", "integer", "Dynamic child index of componentId to crop to",
+				"interfaceId", "integer", "Interface (group) id to crop to: union of its visible component bounds",
+				"padding", "integer", "Extra pixels around the widget/interface crop (default 0)",
+				"x", "integer", "Region crop x (canvas pixels)",
+				"y", "integer", "Region crop y",
+				"width", "integer", "Region crop width",
+				"height", "integer", "Region crop height")),
+			this::screenshot);
+
+		register("get_widget",
+			"Get a widget's values by packed component id: bounds, relative/original position, text, item, sprite, hidden state and children.",
+			schema(props(
+				"componentId", "integer", "Packed component id (interfaceId << 16 | childId)",
+				"childIndex", "integer", "Optional dynamic child index",
+				"depth", "integer", "How many levels of dynamic children to include (default 1, max 5)"),
+				"componentId"),
+			args -> textResult(getWidget(args)));
+
+		register("dump_interface",
+			"Dump every component of an interface with positions/sizes/text. Call twice and diff the JSON to spot layout changes.",
+			schema(props(
+				"interfaceId", "integer", "Interface (group) id to dump",
+				"includeHidden", "boolean", "Include hidden components (default false)"),
+				"interfaceId"),
+			args -> textResult(dumpInterface(args)));
+
+		register("list_interfaces",
+			"List interface (group) ids currently loaded and visible, so you know what can be inspected.",
+			schema(props()),
+			args -> textResult(listInterfaces()));
+
+		register("get_widget_at",
+			"Find the deepest visible widget at a canvas pixel: its packed component id, bounds, text etc plus the parent chain. Use to identify what is at a spot on a screenshot.",
+			schema(props(
+				"x", "integer", "Canvas x",
+				"y", "integer", "Canvas y"),
+				"x", "y"),
+			args -> textResult(getWidgetAt(args)));
+
+		register("set_widget",
+			"Live-edit a widget client-side and revalidate: move, resize, hide, retext, recolor etc. Great for prototyping interface layout changes before touching server code. Server scripts may overwrite the change on the next interface update.",
+			schema(props(
+				"componentId", "integer", "Packed component id of the widget to modify",
+				"childIndex", "integer", "Optional dynamic child index",
+				"hidden", "boolean", "Show/hide the widget",
+				"text", "string", "New text",
+				"x", "integer", "New original X",
+				"y", "integer", "New original Y",
+				"width", "integer", "New original width",
+				"height", "integer", "New original height",
+				"spriteId", "integer", "New sprite id",
+				"opacity", "integer", "New opacity 0-255 (0 = solid)",
+				"textColor", "integer", "New text color as 0xRRGGBB int",
+				"itemId", "integer", "New item id",
+				"itemQuantity", "integer", "New item quantity"),
+				"componentId"),
+			args -> textResult(setWidget(args)));
+
+		register("get_client_state",
+			"Get game state, canvas size, resized/fixed mode, mouse position, player world position/region, run energy, weight, camera yaw/pitch/zoom and whether a right-click menu is open.",
+			schema(props()),
+			args -> textResult(getClientState()));
+
+		register("get_skills",
+			"Local player skills: level, boosted level and xp per skill, plus total level. Hitpoints boosted level = current HP.",
+			schema(props()),
+			args -> textResult(getSkills()));
+
+		// ---- raw input ----
+
+		register("click",
+			"Click at canvas coordinates by dispatching real mouse events.",
+			schema(props(
+				"x", "integer", "Canvas x",
+				"y", "integer", "Canvas y",
+				"button", "integer", "Mouse button: 1=left (default), 2=middle, 3=right"),
+				"x", "y"),
+			this::click);
+
+		register("click_component",
+			"Click the center of a widget resolved by packed component id. Fails if the widget is missing or hidden.",
+			schema(props(
+				"componentId", "integer", "Packed component id to click",
+				"childIndex", "integer", "Optional dynamic child index",
+				"button", "integer", "Mouse button: 1=left (default), 2=middle, 3=right"),
+				"componentId"),
+			this::clickComponent);
+
+		register("hover",
+			"Move the mouse to canvas coordinates or a widget's center without clicking.",
+			schema(props(
+				"x", "integer", "Canvas x",
+				"y", "integer", "Canvas y",
+				"componentId", "integer", "Packed component id to hover (used instead of x/y)",
+				"childIndex", "integer", "Optional dynamic child index")),
+			this::hover);
+
+		register("drag",
+			"Press at the source, drag through intermediate points, release at the target. Source/target are either packed component ids or canvas coordinates.",
+			schema(props(
+				"fromComponentId", "integer", "Packed component id to drag from",
+				"fromChildIndex", "integer", "Optional dynamic child index for the source",
+				"fromX", "integer", "Source canvas x (used if fromComponentId absent)",
+				"fromY", "integer", "Source canvas y",
+				"toComponentId", "integer", "Packed component id to drag to",
+				"toChildIndex", "integer", "Optional dynamic child index for the target",
+				"toX", "integer", "Target canvas x (used if toComponentId absent)",
+				"toY", "integer", "Target canvas y",
+				"steps", "integer", "Number of intermediate drag moves (default 8)",
+				"stepDelayMs", "integer", "Delay between drag moves in ms (default 20)")),
+			this::drag);
+
+		register("type_chat",
+			"Type text into the game chatbox by dispatching key events, then press Enter to send. Works for :: commands.",
+			schema(props(
+				"text", "string", "Text to type into the chatbox, e.g. a chat message or a :: command",
+				"send", "boolean", "Press Enter after typing (default true)"),
+				"text"),
+			this::typeChat);
+
+		register("press_key",
+			"Press a single key on the game canvas (e.g. ESCAPE to close an interface).",
+			schema(props(
+				"key", "string", "Single character, or ENTER, ESCAPE, SPACE, TAB, BACKSPACE, UP, DOWN, LEFT, RIGHT, F1-F12"),
+				"key"),
+			this::pressKey);
+
+		// ---- world ----
+
+		register("walk_to",
+			"Click the tile at world coordinates to walk there. Clicks the viewport when the tile is on screen, otherwise the minimap. Tile must be in the loaded scene.",
+			schema(props(
+				"x", "integer", "World (map) x coordinate",
+				"y", "integer", "World (map) y coordinate",
+				"plane", "integer", "Plane 0-3 (default: current plane)"),
+				"x", "y"),
+			this::walkTo);
+
+		register("list_npcs",
+			"List NPCs with id, index, name, combat level, actions, world location, distance, animation, facing, health (when visible) and canvas position, sorted by distance.",
+			schema(props(
+				"nameFilter", "string", "Case-insensitive substring filter on NPC name",
+				"maxDistance", "integer", "Only NPCs within this many tiles of the player",
+				"maxResults", "integer", "Cap on returned NPCs (default 50)")),
+			args -> textResult(listNpcs(args)));
+
+		register("list_players",
+			"List players with name, combat level, world location, distance, animation, facing, health (when visible) and canvas position, sorted by distance. Local player is flagged isLocal.",
+			schema(props(
+				"nameFilter", "string", "Case-insensitive substring filter on player name",
+				"maxDistance", "integer", "Only players within this many tiles of the local player",
+				"maxResults", "integer", "Cap on returned players (default 50)")),
+			args -> textResult(listPlayers(args)));
+
+		register("list_objects",
+			"List scene objects (game, wall, decorative, ground) with id, name, actions, world position, face direction (orientation in jau 0-2047, degrees and compass) and size, sorted by distance.",
+			schema(props(
+				"nameFilter", "string", "Case-insensitive substring filter on object name",
+				"objectId", "integer", "Only objects with this id",
+				"maxDistance", "integer", "Only objects within this many tiles of the player",
+				"maxResults", "integer", "Cap on returned objects (default 50)")),
+			args -> textResult(listObjects(args)));
+
+		register("list_ground_items",
+			"List items on the floor: itemId, name, quantity, world location and distance, sorted by distance. Use pickup_item to take one.",
+			schema(props(
+				"nameFilter", "string", "Case-insensitive substring filter on item name",
+				"maxDistance", "integer", "Only items within this many tiles of the player",
+				"maxResults", "integer", "Cap on returned items (default 50)")),
+			args -> textResult(listGroundItems(args)));
+
+		register("pickup_item",
+			"Invoke Take on a ground item at world coordinates. Player walks to the tile and picks it up.",
+			schema(props(
+				"itemId", "integer", "Item id from list_ground_items",
+				"x", "integer", "World x of the tile the item is on",
+				"y", "integer", "World y of the tile",
+				"plane", "integer", "Plane (default current)"),
+				"itemId", "x", "y"),
+			args -> textResult(pickupItem(args)));
+
+		register("list_projectiles",
+			"List projectiles currently in flight: id, remaining cycles, start scene position and target point/actor.",
+			schema(props()),
+			args -> textResult(listProjectiles()));
+
+		register("get_inventory",
+			"Read an item container by id: every slot with itemId, name and quantity. 93=inventory, 94=worn, 95=bank; server-made containers work too.",
+			schema(props(
+				"inventoryId", "integer", "Item container id, e.g. 93 inventory, 94 worn equipment, 95 bank",
+				"includeEmpty", "boolean", "Include empty slots as itemId -1 (default false)"),
+				"inventoryId"),
+			args -> textResult(getInventory(args)));
+
+		register("list_inventories",
+			"List all item containers currently loaded in the client: container id, slot count and non-empty item count. Use get_inventory for contents.",
+			schema(props()),
+			args -> textResult(listInventories()));
+
+		// ---- interaction ----
+
+		register("interact_npc",
+			"Invoke a cache-defined right-click option on an NPC (default Talk-to). Only sees options from the NPC definition; for server-added or runtime menu options use get_npc_menu + click_menu_option instead.",
+			schema(props(
+				"npcIndex", "integer", "NPC index from list_npcs (exact match)",
+				"npcName", "string", "Case-insensitive NPC name substring; nearest match wins (used if npcIndex absent)",
+				"option", "string", "Right-click menu option to invoke, e.g. Talk-to, Trade, Attack (default Talk-to)")),
+			args -> textResult(interactNpc(args)));
+
+		register("get_npc_menu",
+			"Hover an NPC and read its live right-click mini-menu: every entry including server-added quick options, top entry first (index 0 = default left-click). Follow with click_menu_option.",
+			schema(props(
+				"npcIndex", "integer", "NPC index from list_npcs (exact match)",
+				"npcName", "string", "Case-insensitive NPC name substring; nearest match wins")),
+			args -> textResult(getNpcMenu(args)));
+
+		register("click_menu_option",
+			"Click an entry of the currently built mini-menu (hover something first, e.g. via get_npc_menu or hover). Invokes the entry exactly as a right-click menu click would.",
+			schema(props(
+				"option", "string", "Case-insensitive substring of the menu option text, e.g. Vote, Trade, Quick-start",
+				"target", "string", "Optional case-insensitive substring of the entry target to disambiguate"),
+				"option"),
+			args -> textResult(clickMenuOption(args)));
+
+		register("item_action",
+			"Right-click an inventory item and click an option in ONE call - no screenshot needed. Finds the item slot, hovers it, invokes the matching menu entry (e.g. Drop). Inventory tab must be visible.",
+			schema(props(
+				"itemId", "integer", "Item id in the inventory",
+				"itemName", "string", "Case-insensitive item name substring (used if itemId absent)",
+				"option", "string", "Right-click option to invoke, e.g. Drop, Eat, Wield, Use, Bury"),
+				"option"),
+			args -> textResult(itemAction(args)));
+
+		register("interact_object",
+			"Interact with a scene object in ONE call - no screenshot needed. Finds the nearest matching object, hovers it and clicks the option. e.g. nameFilter 'tree' + option 'Chop down'. list_objects shows available actions.",
+			schema(props(
+				"objectId", "integer", "Object id to interact with",
+				"nameFilter", "string", "Case-insensitive object name substring; nearest match wins (used if objectId absent)",
+				"option", "string", "Menu option to click, e.g. Chop down, Mine, Bank, Open. Default: the object's first action")),
+			args -> textResult(interactObject(args)));
+
+		register("interact_player",
+			"Interact with another player in ONE call - no screenshot needed. Hovers the player and clicks the matching right-click option, e.g. Trade with.",
+			schema(props(
+				"playerName", "string", "Case-insensitive player name substring; nearest match wins",
+				"option", "string", "Menu option to click, e.g. Trade with, Follow, Challenge, Attack"),
+				"playerName", "option"),
+			args -> textResult(interactPlayer(args)));
+
+		register("widget_action",
+			"Right-click any widget and click a menu option in ONE call: hovers the widget, then invokes the matching mini-menu entry. Works for spells, prayers, equipment, buttons.",
+			schema(props(
+				"componentId", "integer", "Packed component id of the widget",
+				"childIndex", "integer", "Optional dynamic child index",
+				"option", "string", "Case-insensitive substring of the menu option to invoke"),
+				"componentId", "option"),
+			args -> textResult(widgetAction(args)));
+
+		register("invoke_menu_action",
+			"Low-level escape hatch: invoke client.menuAction with raw parameters. Use only when the higher-level interact tools cannot express the action (params visible in get_npc_menu entries or script history).",
+			schema(props(
+				"param0", "integer", "Menu param0 (often slot or scene x)",
+				"param1", "integer", "Menu param1 (often packed widget id or scene y)",
+				"type", "string", "MenuAction enum name, e.g. CC_OP, WIDGET_TARGET, GAME_OBJECT_FIRST_OPTION",
+				"identifier", "integer", "Menu identifier (op index, npc index, object id...)",
+				"itemId", "integer", "Item id (default -1)",
+				"option", "string", "Option text (default empty)",
+				"target", "string", "Target text (default empty)"),
+				"param0", "param1", "type", "identifier"),
+			args -> textResult(invokeRawMenuAction(args)));
+
+		// ---- dialogue ----
+
+		register("get_dialogue",
+			"Read the current dialogue state: NPC/player dialogue text and speaker, numbered options menu, message box, item dialog, or open chatbox input prompt.",
+			schema(props()),
+			args -> textResult(onClientThread(this::readDialogue)));
+
+		register("continue_dialogue",
+			"Press space to advance the current dialogue and return the new dialogue state as soon as it changes.",
+			schema(props()),
+			args ->
+			{
+				String before = dialogueFingerprint();
+				pressNamedKey("SPACE");
+				return textResult(waitDialogueChange(before));
+			});
+
+		register("select_option",
+			"Choose a numbered dialogue option by pressing its number key and return the new dialogue state as soon as it changes.",
+			schema(props(
+				"option", "integer", "Option number as shown by get_dialogue (1-based)"),
+				"option"),
+			this::selectOption);
+
+		register("enter_input",
+			"Type a value into the open chatbox input (string or amount prompt) and press Enter, then return the new dialogue state.",
+			schema(props(
+				"text", "string", "Value to type: a string or a number depending on the prompt"),
+				"text"),
+			this::enterInput);
+
+		// ---- history and vars ----
+
+		register("get_script_history",
+			"Report clientscripts fired recently: per-script fire counts plus individual events with game tick, timestamp and root-script arguments.",
+			schema(props(
+				"sinceMs", "integer", "Window in milliseconds looking back from now (default 5000)",
+				"scriptId", "integer", "Only this clientscript id",
+				"limit", "integer", "Max events returned, newest kept (default 200)")),
+			args -> textResult(recorder.scriptHistory(
+				optInt(args, "sinceMs", 5000),
+				args.has("scriptId") ? args.get("scriptId").getAsInt() : null,
+				optInt(args, "limit", 200))));
+
+		register("get_var_history",
+			"Report varbit, varp and varc changes in a recent window, in order, with old and new values, game tick and timestamp.",
+			schema(props(
+				"sinceMs", "integer", "Window in milliseconds looking back from now (default 5000)",
+				"type", "string", "Filter: varbit, varp, varcint or varcstr",
+				"id", "integer", "Only this varbit/varp/varc id",
+				"limit", "integer", "Max events returned, newest kept (default 200)")),
+			args -> textResult(recorder.varHistory(
+				optInt(args, "sinceMs", 5000),
+				args.has("type") ? args.get("type").getAsString() : null,
+				args.has("id") ? args.get("id").getAsInt() : null,
+				optInt(args, "limit", 200))));
+
+		register("get_var",
+			"Read the current value of a varbit, varp, varc int or varc string.",
+			schema(props(
+				"type", "string", "One of: varbit, varp, varcint, varcstr",
+				"id", "integer", "The varbit/varp/varc id"),
+				"type", "id"),
+			args -> textResult(getVar(args)));
+
+		register("get_projectile_history",
+			"Report projectiles launched recently: id, start position, slope/height values, cycles and target, one entry per projectile.",
+			schema(props(
+				"sinceMs", "integer", "Window in milliseconds looking back from now (default 10000)",
+				"projectileId", "integer", "Only this projectile (gfx) id",
+				"limit", "integer", "Max events returned (default 200)")),
+			args -> textResult(recorder.projectileHistory(
+				optInt(args, "sinceMs", 10000),
+				args.has("projectileId") ? args.get("projectileId").getAsInt() : null,
+				optInt(args, "limit", 200))));
+
+		register("get_effect_history",
+			"Report animations and graphics (spotanims) played by NPCs/players recently, with actor name, npc id, value and game tick.",
+			schema(props(
+				"sinceMs", "integer", "Window in milliseconds looking back from now (default 10000)",
+				"kind", "string", "Filter: animation or graphic",
+				"actorName", "string", "Case-insensitive substring filter on the actor name",
+				"limit", "integer", "Max events returned (default 200)")),
+			args -> textResult(recorder.effectHistory(
+				optInt(args, "sinceMs", 10000),
+				args.has("kind") ? args.get("kind").getAsString() : null,
+				args.has("actorName") ? args.get("actorName").getAsString() : null,
+				optInt(args, "limit", 200))));
+
+		register("get_chat_history",
+			"Read chatbox messages received recently: type, sender, message, game tick and timestamp. Covers game messages, public/private chat etc (not NPC dialogue - use get_dialogue).",
+			schema(props(
+				"sinceMs", "integer", "Window in milliseconds looking back from now (default 60000)",
+				"type", "string", "Filter by ChatMessageType name, e.g. GAMEMESSAGE, PUBLICCHAT, PRIVATECHAT, SPAM",
+				"nameFilter", "string", "Case-insensitive substring filter on the sender name",
+				"limit", "integer", "Max messages returned (default 100)")),
+			args -> textResult(recorder.chatHistory(
+				optInt(args, "sinceMs", 60000),
+				args.has("type") ? args.get("type").getAsString() : null,
+				args.has("nameFilter") ? args.get("nameFilter").getAsString() : null,
+				optInt(args, "limit", 100))));
+
+		// ---- waiting ----
+
+		register("wait_for",
+			"Block until a game condition is met, checked every 100ms - returns the moment it happens. Use this after walk_to/interact/attack instead of taking screenshots or guessing delays. Returns met:false with current state on timeout.",
+			schema(props(
+				"condition", "string", "What to wait for: idle (player stopped animating/moving), at_tile (arrived at x/y), npc_dead (npcIndex/npcName), dialogue (any dialogue opened), interface_open / interface_closed (interfaceId), chat_message (textContains appeared)",
+				"timeoutMs", "integer", "Give up after this long (default 10000, max 60000)",
+				"x", "integer", "at_tile: world x",
+				"y", "integer", "at_tile: world y",
+				"range", "integer", "at_tile: max tiles away to count as arrived (default 1)",
+				"npcIndex", "integer", "npc_dead: NPC index from list_npcs",
+				"npcName", "string", "npc_dead: NPC name substring",
+				"interfaceId", "integer", "interface_open/closed: interface group id",
+				"textContains", "string", "chat_message: case-insensitive substring to watch for"),
+				"condition"),
+			this::waitFor);
+	}
+
+	/** Build a JSON Schema properties object from (name, type, description) triples. */
+	private static JsonObject props(String... triples)
+	{
+		JsonObject o = new JsonObject();
+		for (int i = 0; i < triples.length; i += 3)
+		{
+			o.add(triples[i], prop(triples[i + 1], triples[i + 2]));
+		}
+		return o;
+	}
+
+	// --- tools ---
+
+	private JsonObject screenshot(JsonObject args) throws Exception
+	{
+		Rectangle crop = null;
+		if (args.has("componentId"))
+		{
+			int padding = optInt(args, "padding", 0);
+			Rectangle bounds = onClientThread(() ->
+			{
+				Widget w = resolveWidget(args, "componentId", "childIndex");
+				return w == null || w.isHidden() ? null : w.getBounds();
+			});
+			if (bounds == null)
+			{
+				throw new IllegalArgumentException("Widget not found or hidden: " + describeId(args, "componentId", "childIndex"));
+			}
+			crop = pad(bounds, padding);
+		}
+		else if (args.has("interfaceId"))
+		{
+			int interfaceId = args.get("interfaceId").getAsInt();
+			int padding = optInt(args, "padding", 0);
+			Rectangle bounds = onClientThread(() -> interfaceBounds(interfaceId));
+			if (bounds == null)
+			{
+				throw new IllegalArgumentException("Interface " + interfaceId + " is not loaded or has no visible components");
+			}
+			crop = pad(bounds, padding);
+		}
+		else if (args.has("x") && args.has("y") && args.has("width") && args.has("height"))
+		{
+			crop = new Rectangle(args.get("x").getAsInt(), args.get("y").getAsInt(),
+				args.get("width").getAsInt(), args.get("height").getAsInt());
+		}
+
+		BufferedImage frame = captureFrame();
+		if (crop != null)
+		{
+			Rectangle clamped = crop.intersection(new Rectangle(0, 0, frame.getWidth(), frame.getHeight()));
+			if (clamped.isEmpty())
+			{
+				throw new IllegalArgumentException("Crop region " + crop + " is outside the canvas ("
+					+ frame.getWidth() + "x" + frame.getHeight() + ")");
+			}
+			frame = frame.getSubimage(clamped.x, clamped.y, clamped.width, clamped.height);
+			crop = clamped;
+		}
+
+		JsonObject image = new JsonObject();
+		image.addProperty("type", "image");
+		image.addProperty("data", pngBase64(frame));
+		image.addProperty("mimeType", "image/png");
+
+		JsonArray content = new JsonArray();
+		content.add(image);
+		JsonObject result = new JsonObject();
+		result.add("content", content);
+		return result;
+	}
+
+	private JsonElement getWidget(JsonObject args) throws Exception
+	{
+		int depth = Math.min(optInt(args, "depth", 1), 5);
+		JsonElement result = onClientThread(() ->
+		{
+			Widget w = resolveWidget(args, "componentId", "childIndex");
+			return w == null ? null : describeWidget(w, depth, true);
+		});
+		if (result == null)
+		{
+			throw new IllegalArgumentException("Widget not found: " + describeId(args, "componentId", "childIndex"));
+		}
+		return result;
+	}
+
+	private JsonElement dumpInterface(JsonObject args) throws Exception
+	{
+		int interfaceId = args.get("interfaceId").getAsInt();
+		boolean includeHidden = args.has("includeHidden") && args.get("includeHidden").getAsBoolean();
+		return onClientThread(() ->
+		{
+			JsonArray components = new JsonArray();
+			int found = 0;
+			int gap = 0;
+			for (int child = 0; child < MAX_COMPONENTS_PER_INTERFACE && gap < COMPONENT_SCAN_GAP; child++)
+			{
+				Widget w = client.getWidget(WidgetUtil.packComponentId(interfaceId, child));
+				if (w == null)
+				{
+					gap++;
+					continue;
+				}
+				gap = 0;
+				found++;
+				if (includeHidden || !w.isHidden())
+				{
+					components.add(describeWidget(w, 1, includeHidden));
+				}
+			}
+			JsonObject result = new JsonObject();
+			result.addProperty("interfaceId", interfaceId);
+			result.addProperty("componentCount", found);
+			result.add("components", components);
+			return result;
+		});
+	}
+
+	private JsonElement listInterfaces() throws Exception
+	{
+		return onClientThread(() ->
+		{
+			Set<Integer> visible = new HashSet<>();
+			Set<Integer> loaded = new HashSet<>();
+			Widget[] roots = client.getWidgetRoots();
+			if (roots != null)
+			{
+				Deque<Widget> queue = new ArrayDeque<>();
+				for (Widget root : roots)
+				{
+					if (root != null)
+					{
+						queue.add(root);
+					}
+				}
+				while (!queue.isEmpty())
+				{
+					Widget w = queue.poll();
+					int group = WidgetUtil.componentToInterface(w.getId());
+					loaded.add(group);
+					if (!w.isHidden())
+					{
+						visible.add(group);
+					}
+					enqueueChildren(queue, w.getStaticChildren());
+					enqueueChildren(queue, w.getNestedChildren());
+				}
+			}
+			JsonObject result = new JsonObject();
+			result.add("visibleInterfaceIds", toArray(visible));
+			result.add("loadedInterfaceIds", toArray(loaded));
+			return result;
+		});
+	}
+
+	private JsonElement getClientState() throws Exception
+	{
+		return onClientThread(() ->
+		{
+			JsonObject result = new JsonObject();
+			result.addProperty("gameState", client.getGameState().name());
+			result.addProperty("canvasWidth", client.getCanvasWidth());
+			result.addProperty("canvasHeight", client.getCanvasHeight());
+			result.addProperty("resized", client.isResized());
+			net.runelite.api.Point mouse = client.getMouseCanvasPosition();
+			if (mouse != null)
+			{
+				result.addProperty("mouseX", mouse.getX());
+				result.addProperty("mouseY", mouse.getY());
+			}
+			Player local = client.getLocalPlayer();
+			if (local != null && local.getWorldLocation() != null)
+			{
+				WorldPoint wp = local.getWorldLocation();
+				result.addProperty("worldX", wp.getX());
+				result.addProperty("worldY", wp.getY());
+				result.addProperty("plane", wp.getPlane());
+				result.addProperty("regionId", wp.getRegionID());
+			}
+			result.addProperty("runEnergy", client.getEnergy());
+			result.addProperty("weight", client.getWeight());
+			result.addProperty("menuOpen", client.isMenuOpen());
+			result.addProperty("cameraYaw", client.getCameraYaw());
+			result.addProperty("cameraPitch", client.getCameraPitch());
+			result.addProperty("cameraZoom", client.get3dZoom());
+			return result;
+		});
+	}
+
+	private JsonElement setWidget(JsonObject args) throws Exception
+	{
+		return onClientThread(() ->
+		{
+			Widget w = resolveWidget(args, "componentId", "childIndex");
+			if (w == null)
+			{
+				throw new IllegalArgumentException("Widget not found: " + describeId(args, "componentId", "childIndex"));
+			}
+			if (args.has("hidden"))
+			{
+				w.setHidden(args.get("hidden").getAsBoolean());
+			}
+			if (args.has("text"))
+			{
+				w.setText(args.get("text").getAsString());
+			}
+			if (args.has("x"))
+			{
+				w.setOriginalX(args.get("x").getAsInt());
+			}
+			if (args.has("y"))
+			{
+				w.setOriginalY(args.get("y").getAsInt());
+			}
+			if (args.has("width"))
+			{
+				w.setOriginalWidth(args.get("width").getAsInt());
+			}
+			if (args.has("height"))
+			{
+				w.setOriginalHeight(args.get("height").getAsInt());
+			}
+			if (args.has("spriteId"))
+			{
+				w.setSpriteId(args.get("spriteId").getAsInt());
+			}
+			if (args.has("opacity"))
+			{
+				w.setOpacity(args.get("opacity").getAsInt());
+			}
+			if (args.has("textColor"))
+			{
+				w.setTextColor(args.get("textColor").getAsInt());
+			}
+			if (args.has("itemId"))
+			{
+				w.setItemId(args.get("itemId").getAsInt());
+			}
+			if (args.has("itemQuantity"))
+			{
+				w.setItemQuantity(args.get("itemQuantity").getAsInt());
+			}
+			w.revalidate();
+			return describeWidget(w, 0, true);
+		});
+	}
+
+	private JsonElement getWidgetAt(JsonObject args) throws Exception
+	{
+		int x = args.get("x").getAsInt();
+		int y = args.get("y").getAsInt();
+		return onClientThread(() ->
+		{
+			Widget best = null;
+			Widget[] roots = client.getWidgetRoots();
+			if (roots != null)
+			{
+				for (Widget root : roots)
+				{
+					best = deepestWidgetAt(root, x, y, best);
+				}
+			}
+			if (best == null)
+			{
+				throw new IllegalArgumentException("No visible widget at " + x + "," + y);
+			}
+			JsonObject o = describeWidget(best, 0, false);
+			JsonArray parentChain = new JsonArray();
+			for (Widget parent = best.getParent(); parent != null; parent = parent.getParent())
+			{
+				parentChain.add(parent.getId());
+			}
+			o.add("parentChain", parentChain);
+			return o;
+		});
+	}
+
+	/**
+	 * Depth-first search for the deepest visible widget containing the point;
+	 * later siblings win like the renderer. Must be called on the client thread.
+	 */
+	private Widget deepestWidgetAt(Widget w, int x, int y, Widget best)
+	{
+		if (w == null || w.isHidden())
+		{
+			return best;
+		}
+		Rectangle b = w.getBounds();
+		if (b != null && b.contains(x, y))
+		{
+			best = w;
+		}
+		Widget[][] childGroups = {w.getStaticChildren(), w.getDynamicChildren(), w.getNestedChildren()};
+		for (Widget[] children : childGroups)
+		{
+			if (children == null)
+			{
+				continue;
+			}
+			for (Widget child : children)
+			{
+				best = deepestWidgetAt(child, x, y, best);
+			}
+		}
+		return best;
+	}
+
+	private JsonElement invokeRawMenuAction(JsonObject args) throws Exception
+	{
+		MenuAction type = MenuAction.valueOf(args.get("type").getAsString());
+		int param0 = args.get("param0").getAsInt();
+		int param1 = args.get("param1").getAsInt();
+		int identifier = args.get("identifier").getAsInt();
+		int itemId = optInt(args, "itemId", -1);
+		String option = args.has("option") ? args.get("option").getAsString() : "";
+		String target = args.has("target") ? args.get("target").getAsString() : "";
+		return onClientThread(() ->
+		{
+			client.menuAction(param0, param1, type, identifier, itemId, option, target);
+			JsonObject result = new JsonObject();
+			result.addProperty("invoked", type.name());
+			result.addProperty("identifier", identifier);
+			return result;
+		});
+	}
+
+	private JsonObject click(JsonObject args) throws Exception
+	{
+		int x = args.get("x").getAsInt();
+		int y = args.get("y").getAsInt();
+		int button = optInt(args, "button", MouseEvent.BUTTON1);
+		clickAt(x, y, button);
+		return textResult("Clicked button " + button + " at " + x + "," + y);
+	}
+
+	private JsonObject clickComponent(JsonObject args) throws Exception
+	{
+		int button = optInt(args, "button", MouseEvent.BUTTON1);
+		Rectangle bounds = onClientThread(() ->
+		{
+			Widget w = resolveWidget(args, "componentId", "childIndex");
+			return w == null || w.isHidden() ? null : w.getBounds();
+		});
+		if (bounds == null || bounds.width <= 0 || bounds.height <= 0)
+		{
+			throw new IllegalArgumentException("Widget not found, hidden or has no bounds: "
+				+ describeId(args, "componentId", "childIndex"));
+		}
+		int x = bounds.x + bounds.width / 2;
+		int y = bounds.y + bounds.height / 2;
+		clickAt(x, y, button);
+		return textResult("Clicked " + describeId(args, "componentId", "childIndex")
+			+ " at " + x + "," + y + " (bounds " + bounds.x + "," + bounds.y + " "
+			+ bounds.width + "x" + bounds.height + ")");
+	}
+
+	private JsonObject hover(JsonObject args) throws Exception
+	{
+		Point p = resolvePoint(args, "componentId", "childIndex", "x", "y");
+		dispatchMouse(MouseEvent.MOUSE_MOVED, p.x, p.y, MouseEvent.NOBUTTON, 0);
+		return textResult("Hovering at " + p.x + "," + p.y);
+	}
+
+	private JsonObject drag(JsonObject args) throws Exception
+	{
+		Point from = resolvePoint(args, "fromComponentId", "fromChildIndex", "fromX", "fromY");
+		Point to = resolvePoint(args, "toComponentId", "toChildIndex", "toX", "toY");
+		int steps = Math.max(1, optInt(args, "steps", 8));
+		long stepDelay = optInt(args, "stepDelayMs", 20);
+
+		dispatchMouse(MouseEvent.MOUSE_MOVED, from.x, from.y, MouseEvent.NOBUTTON, 0);
+		Thread.sleep(30);
+		dispatchMouse(MouseEvent.MOUSE_PRESSED, from.x, from.y, MouseEvent.BUTTON1, 1);
+		Thread.sleep(100);
+		for (int i = 1; i <= steps; i++)
+		{
+			int x = from.x + (to.x - from.x) * i / steps;
+			int y = from.y + (to.y - from.y) * i / steps;
+			dispatchMouse(MouseEvent.MOUSE_DRAGGED, x, y, MouseEvent.BUTTON1, 0);
+			Thread.sleep(stepDelay);
+		}
+		dispatchMouse(MouseEvent.MOUSE_RELEASED, to.x, to.y, MouseEvent.BUTTON1, 1);
+		return textResult("Dragged from " + from.x + "," + from.y + " to " + to.x + "," + to.y);
+	}
+
+	private JsonObject typeChat(JsonObject args) throws Exception
+	{
+		String text = args.get("text").getAsString();
+		boolean send = !args.has("send") || args.get("send").getAsBoolean();
+		for (char c : text.toCharArray())
+		{
+			typeChar(c);
+		}
+		if (send)
+		{
+			pressNamedKey("ENTER");
+		}
+		return textResult((send ? "Typed and sent: " : "Typed: ") + text);
+	}
+
+	private JsonObject pressKey(JsonObject args) throws Exception
+	{
+		String key = args.get("key").getAsString();
+		if (key.length() == 1)
+		{
+			typeChar(key.charAt(0));
+		}
+		else
+		{
+			pressNamedKey(key.toUpperCase());
+		}
+		return textResult("Pressed " + key);
+	}
+
+	private JsonObject walkTo(JsonObject args) throws Exception
+	{
+		int x = args.get("x").getAsInt();
+		int y = args.get("y").getAsInt();
+		Integer planeArg = args.has("plane") ? args.get("plane").getAsInt() : null;
+		JsonObject target = onClientThread(() ->
+		{
+			int plane = planeArg != null ? planeArg : client.getPlane();
+			LocalPoint lp = LocalPoint.fromWorld(client, new WorldPoint(x, y, plane));
+			if (lp == null)
+			{
+				return null;
+			}
+			net.runelite.api.Point p = Perspective.localToCanvas(client, lp, plane);
+			JsonObject t = new JsonObject();
+			if (p != null && p.getX() >= 0 && p.getY() >= 0
+				&& p.getX() < client.getCanvasWidth() && p.getY() < client.getCanvasHeight())
+			{
+				t.addProperty("x", p.getX());
+				t.addProperty("y", p.getY());
+				t.addProperty("via", "viewport");
+				return t;
+			}
+			net.runelite.api.Point mp = Perspective.localToMinimap(client, lp);
+			if (mp != null)
+			{
+				t.addProperty("x", mp.getX());
+				t.addProperty("y", mp.getY());
+				t.addProperty("via", "minimap");
+				return t;
+			}
+			return null;
+		});
+		if (target == null)
+		{
+			throw new IllegalArgumentException("Tile " + x + "," + y
+				+ " is not in the loaded scene or not visible on the viewport/minimap");
+		}
+		int cx = target.get("x").getAsInt();
+		int cy = target.get("y").getAsInt();
+		String via = target.get("via").getAsString();
+		clickAt(cx, cy, MouseEvent.BUTTON1);
+		return textResult("Clicked " + via + " at " + cx + "," + cy + " to walk to " + x + "," + y);
+	}
+
+	private JsonElement listNpcs(JsonObject args) throws Exception
+	{
+		String filter = args.has("nameFilter") ? args.get("nameFilter").getAsString().toLowerCase() : null;
+		int maxDistance = optInt(args, "maxDistance", Integer.MAX_VALUE);
+		int maxResults = optInt(args, "maxResults", 50);
+		return onClientThread(() ->
+		{
+			WorldPoint me = client.getLocalPlayer() != null ? client.getLocalPlayer().getWorldLocation() : null;
+			List<JsonObject> list = new ArrayList<>();
+			for (NPC npc : client.getNpcs())
+			{
+				if (npc == null || !matchesName(npc.getName(), filter))
+				{
+					continue;
+				}
+				JsonObject o = describeActor(npc, me, maxDistance);
+				if (o == null)
+				{
+					continue;
+				}
+				o.addProperty("npcId", npc.getId());
+				o.addProperty("index", npc.getIndex());
+				NPCComposition comp = npc.getTransformedComposition() != null
+					? npc.getTransformedComposition()
+					: npc.getComposition();
+				if (comp != null && comp.getActions() != null)
+				{
+					JsonArray actions = new JsonArray();
+					for (String action : comp.getActions())
+					{
+						if (action != null)
+						{
+							actions.add(action);
+						}
+					}
+					if (actions.size() > 0)
+					{
+						o.add("actions", actions);
+					}
+				}
+				list.add(o);
+			}
+			return actorListResult("npcs", list, maxResults);
+		});
+	}
+
+	private JsonElement listPlayers(JsonObject args) throws Exception
+	{
+		String filter = args.has("nameFilter") ? args.get("nameFilter").getAsString().toLowerCase() : null;
+		int maxDistance = optInt(args, "maxDistance", Integer.MAX_VALUE);
+		int maxResults = optInt(args, "maxResults", 50);
+		return onClientThread(() ->
+		{
+			Player local = client.getLocalPlayer();
+			WorldPoint me = local != null ? local.getWorldLocation() : null;
+			List<JsonObject> list = new ArrayList<>();
+			for (Player player : client.getPlayers())
+			{
+				if (player == null || !matchesName(player.getName(), filter))
+				{
+					continue;
+				}
+				JsonObject o = describeActor(player, me, maxDistance);
+				if (o == null)
+				{
+					continue;
+				}
+				if (player == local)
+				{
+					o.addProperty("isLocal", true);
+				}
+				list.add(o);
+			}
+			return actorListResult("players", list, maxResults);
+		});
+	}
+
+	private static final MenuAction[] NPC_MENU_ACTIONS = {
+		MenuAction.NPC_FIRST_OPTION,
+		MenuAction.NPC_SECOND_OPTION,
+		MenuAction.NPC_THIRD_OPTION,
+		MenuAction.NPC_FOURTH_OPTION,
+		MenuAction.NPC_FIFTH_OPTION,
+	};
+
+	private JsonElement interactNpc(JsonObject args) throws Exception
+	{
+		String option = args.has("option") ? args.get("option").getAsString() : "Talk-to";
+		return onClientThread(() ->
+		{
+			NPC npc = findNpc(args);
+			if (npc == null)
+			{
+				throw new IllegalArgumentException("NPC not found; use list_npcs to see what is nearby");
+			}
+			NPCComposition comp = npc.getTransformedComposition() != null
+				? npc.getTransformedComposition()
+				: npc.getComposition();
+			String[] actions = comp != null ? comp.getActions() : null;
+			int actionIndex = -1;
+			if (actions != null)
+			{
+				for (int i = 0; i < actions.length && i < NPC_MENU_ACTIONS.length; i++)
+				{
+					if (actions[i] != null && actions[i].equalsIgnoreCase(option))
+					{
+						actionIndex = i;
+						break;
+					}
+				}
+			}
+			if (actionIndex == -1)
+			{
+				throw new IllegalArgumentException("NPC " + npc.getName() + " has no option '" + option
+					+ "'. Available: " + availableActions(actions));
+			}
+			client.menuAction(0, 0, NPC_MENU_ACTIONS[actionIndex], npc.getIndex(), -1,
+				actions[actionIndex], npc.getName());
+			JsonObject result = new JsonObject();
+			result.addProperty("invoked", actions[actionIndex]);
+			result.addProperty("npc", npc.getName());
+			result.addProperty("npcIndex", npc.getIndex());
+			result.addProperty("note", "Player may need to walk to the NPC; poll get_dialogue for the conversation");
+			return result;
+		});
+	}
+
+	private JsonElement getNpcMenu(JsonObject args) throws Exception
+	{
+		Point hover = onClientThread(() ->
+		{
+			NPC npc = findNpc(args);
+			if (npc == null)
+			{
+				throw new IllegalArgumentException("NPC not found; use list_npcs to see what is nearby");
+			}
+			Point p = actorHoverPoint(npc);
+			if (p == null)
+			{
+				throw new IllegalArgumentException("NPC " + npc.getName() + " is not visible on screen");
+			}
+			return p;
+		});
+		dispatchMouse(MouseEvent.MOUSE_MOVED, hover.x, hover.y, MouseEvent.NOBUTTON, 0);
+		// Let the client rebuild the mini-menu for the hovered target
+		Thread.sleep(150);
+		return onClientThread(() ->
+		{
+			JsonObject result = new JsonObject();
+			result.addProperty("hoverX", hover.x);
+			result.addProperty("hoverY", hover.y);
+			result.add("entries", menuEntriesJson());
+			return result;
+		});
+	}
+
+	private JsonElement clickMenuOption(JsonObject args) throws Exception
+	{
+		String option = args.get("option").getAsString().toLowerCase();
+		String target = args.has("target") ? args.get("target").getAsString().toLowerCase() : null;
+		return onClientThread(() -> invokeMenuEntry(option, target));
+	}
+
+	private JsonElement itemAction(JsonObject args) throws Exception
+	{
+		String option = args.get("option").getAsString().toLowerCase();
+		Integer itemId = args.has("itemId") ? args.get("itemId").getAsInt() : null;
+		String itemName = args.has("itemName") ? args.get("itemName").getAsString().toLowerCase() : null;
+		if (itemId == null && itemName == null)
+		{
+			throw new IllegalArgumentException("Provide itemId or itemName");
+		}
+		Point hover = onClientThread(() ->
+		{
+			Widget inventory = client.getWidget(InterfaceID.Inventory.ITEMS);
+			if (inventory == null || inventory.isHidden())
+			{
+				throw new IllegalStateException("Inventory widget is not visible; open the inventory tab first");
+			}
+			Widget[] slots = inventory.getDynamicChildren();
+			if (slots != null)
+			{
+				for (Widget slot : slots)
+				{
+					if (slot == null || slot.getItemId() <= 0)
+					{
+						continue;
+					}
+					if (itemId != null && slot.getItemId() != itemId)
+					{
+						continue;
+					}
+					if (itemName != null)
+					{
+						ItemComposition composition = client.getItemDefinition(slot.getItemId());
+						String name = composition != null ? composition.getName() : null;
+						if (name == null || !name.toLowerCase().contains(itemName))
+						{
+							continue;
+						}
+					}
+					Rectangle b = slot.getBounds();
+					if (b != null && b.width > 0 && b.height > 0)
+					{
+						return new Point(b.x + b.width / 2, b.y + b.height / 2);
+					}
+				}
+			}
+			throw new IllegalArgumentException("Item not found in inventory: "
+				+ (itemId != null ? "id " + itemId : itemName));
+		});
+		return hoverAndInvoke(hover, option, null);
+	}
+
+	private JsonElement widgetAction(JsonObject args) throws Exception
+	{
+		String option = args.get("option").getAsString().toLowerCase();
+		Rectangle bounds = onClientThread(() ->
+		{
+			Widget w = resolveWidget(args, "componentId", "childIndex");
+			return w == null || w.isHidden() ? null : w.getBounds();
+		});
+		if (bounds == null || bounds.width <= 0 || bounds.height <= 0)
+		{
+			throw new IllegalArgumentException("Widget not found, hidden or has no bounds: "
+				+ describeId(args, "componentId", "childIndex"));
+		}
+		return hoverAndInvoke(new Point(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2),
+			option, null);
+	}
+
+	private JsonElement interactObject(JsonObject args) throws Exception
+	{
+		Integer objectId = args.has("objectId") ? args.get("objectId").getAsInt() : null;
+		String nameFilter = args.has("nameFilter") ? args.get("nameFilter").getAsString().toLowerCase() : null;
+		if (objectId == null && nameFilter == null)
+		{
+			throw new IllegalArgumentException("Provide objectId or nameFilter");
+		}
+		JsonObject found = onClientThread(() -> findObjectHover(objectId, nameFilter));
+		String option = args.has("option")
+			? args.get("option").getAsString().toLowerCase()
+			: found.get("defaultOption").getAsString().toLowerCase();
+		JsonElement clicked = hoverAndInvoke(
+			new Point(found.get("hoverX").getAsInt(), found.get("hoverY").getAsInt()), option, null);
+		JsonObject result = clicked.getAsJsonObject();
+		result.addProperty("object", found.get("name").getAsString());
+		result.addProperty("objectId", found.get("objectId").getAsInt());
+		return result;
+	}
+
+	/**
+	 * Nearest visible scene object matching the filters, with a hover point and its
+	 * default action. Must be called on the client thread.
+	 */
+	private JsonObject findObjectHover(Integer objectId, String nameFilter)
+	{
+		Scene scene = client.getScene();
+		if (scene == null)
+		{
+			throw new IllegalStateException("No scene is loaded");
+		}
+		WorldPoint me = client.getLocalPlayer() != null ? client.getLocalPlayer().getWorldLocation() : null;
+		Tile[][] tiles = scene.getTiles()[client.getPlane()];
+		Set<GameObject> seen = new HashSet<>();
+		TileObject best = null;
+		String bestName = null;
+		String bestDefault = null;
+		int bestDistance = Integer.MAX_VALUE;
+		Point bestHover = null;
+		for (Tile[] column : tiles)
+		{
+			for (Tile tile : column)
+			{
+				if (tile == null)
+				{
+					continue;
+				}
+				List<TileObject> candidates = new ArrayList<>();
+				GameObject[] gameObjects = tile.getGameObjects();
+				if (gameObjects != null)
+				{
+					for (GameObject go : gameObjects)
+					{
+						if (go != null && seen.add(go))
+						{
+							candidates.add(go);
+						}
+					}
+				}
+				if (tile.getWallObject() != null)
+				{
+					candidates.add(tile.getWallObject());
+				}
+				if (tile.getGroundObject() != null)
+				{
+					candidates.add(tile.getGroundObject());
+				}
+				if (tile.getDecorativeObject() != null)
+				{
+					candidates.add(tile.getDecorativeObject());
+				}
+				for (TileObject obj : candidates)
+				{
+					if (objectId != null && obj.getId() != objectId)
+					{
+						continue;
+					}
+					ObjectComposition composition = client.getObjectDefinition(obj.getId());
+					String name = composition != null ? composition.getName() : null;
+					if (nameFilter != null && (name == null || !name.toLowerCase().contains(nameFilter)))
+					{
+						continue;
+					}
+					int distance = me != null && obj.getWorldLocation() != null
+						? me.distanceTo(obj.getWorldLocation())
+						: 0;
+					if (distance >= bestDistance)
+					{
+						continue;
+					}
+					Point hover = objectHoverPoint(obj);
+					if (hover == null)
+					{
+						continue;
+					}
+					String defaultAction = null;
+					if (composition != null && composition.getActions() != null)
+					{
+						for (String action : composition.getActions())
+						{
+							if (action != null)
+							{
+								defaultAction = action;
+								break;
+							}
+						}
+					}
+					best = obj;
+					bestName = name;
+					bestDefault = defaultAction;
+					bestDistance = distance;
+					bestHover = hover;
+				}
+			}
+		}
+		if (best == null)
+		{
+			throw new IllegalArgumentException("No visible object matching "
+				+ (objectId != null ? "id " + objectId : "'" + nameFilter + "'")
+				+ "; use list_objects to see what is nearby");
+		}
+		if (bestDefault == null)
+		{
+			bestDefault = "";
+		}
+		JsonObject o = new JsonObject();
+		o.addProperty("objectId", best.getId());
+		o.addProperty("name", bestName != null ? bestName : "");
+		o.addProperty("defaultOption", bestDefault);
+		o.addProperty("hoverX", bestHover.x);
+		o.addProperty("hoverY", bestHover.y);
+		return o;
+	}
+
+	private JsonElement interactPlayer(JsonObject args) throws Exception
+	{
+		String playerName = args.get("playerName").getAsString().toLowerCase();
+		String option = args.get("option").getAsString().toLowerCase();
+		Point hover = onClientThread(() ->
+		{
+			Player local = client.getLocalPlayer();
+			WorldPoint me = local != null ? local.getWorldLocation() : null;
+			Player best = null;
+			int bestDistance = Integer.MAX_VALUE;
+			for (Player player : client.getPlayers())
+			{
+				if (player == null || player == local || player.getName() == null
+					|| !player.getName().toLowerCase().contains(playerName))
+				{
+					continue;
+				}
+				int distance = me != null && player.getWorldLocation() != null
+					? me.distanceTo(player.getWorldLocation())
+					: 0;
+				if (distance < bestDistance)
+				{
+					best = player;
+					bestDistance = distance;
+				}
+			}
+			if (best == null)
+			{
+				throw new IllegalArgumentException("Player not found: " + playerName
+					+ "; use list_players to see who is nearby");
+			}
+			Point p = actorHoverPoint(best);
+			if (p == null)
+			{
+				throw new IllegalArgumentException("Player " + best.getName() + " is not visible on screen");
+			}
+			return p;
+		});
+		return hoverAndInvoke(hover, option, null);
+	}
+
+	/**
+	 * Move the mouse to a point, wait for the client to rebuild the mini-menu,
+	 * then invoke the entry matching the option.
+	 */
+	private JsonElement hoverAndInvoke(Point hover, String optionLower, String targetLower) throws Exception
+	{
+		dispatchMouse(MouseEvent.MOUSE_MOVED, hover.x, hover.y, MouseEvent.NOBUTTON, 0);
+		Thread.sleep(150);
+		return onClientThread(() -> invokeMenuEntry(optionLower, targetLower));
+	}
+
+	/**
+	 * Find and invoke a mini-menu entry, top-down like the rendered menu.
+	 * Must be called on the client thread.
+	 */
+	private JsonObject invokeMenuEntry(String optionLower, String targetLower)
+	{
+		MenuEntry[] entries = client.getMenuEntries();
+		for (int i = entries.length - 1; i >= 0; i--)
+		{
+			MenuEntry entry = entries[i];
+			if (entry == null || entry.getOption() == null
+				|| !entry.getOption().toLowerCase().contains(optionLower))
+			{
+				continue;
+			}
+			if (targetLower != null && (entry.getTarget() == null
+				|| !entry.getTarget().toLowerCase().contains(targetLower)))
+			{
+				continue;
+			}
+			client.menuAction(entry.getParam0(), entry.getParam1(), entry.getType(),
+				entry.getIdentifier(), entry.getItemId(), entry.getOption(), entry.getTarget());
+			JsonObject result = new JsonObject();
+			result.addProperty("clicked", entry.getOption());
+			result.addProperty("target", entry.getTarget());
+			return result;
+		}
+		throw new IllegalArgumentException("No menu entry matching '" + optionLower
+			+ "'. Current menu: " + McpHttpServer.GSON.toJson(menuEntriesJson()));
+	}
+
+	/**
+	 * Current mini-menu entries, top entry first (index 0 = default left-click action).
+	 * Must be called on the client thread.
+	 */
+	private JsonArray menuEntriesJson()
+	{
+		MenuEntry[] entries = client.getMenuEntries();
+		JsonArray arr = new JsonArray();
+		for (int i = entries.length - 1; i >= 0; i--)
+		{
+			MenuEntry entry = entries[i];
+			if (entry == null)
+			{
+				continue;
+			}
+			JsonObject o = new JsonObject();
+			o.addProperty("index", entries.length - 1 - i);
+			o.addProperty("option", entry.getOption());
+			o.addProperty("target", entry.getTarget());
+			o.addProperty("type", entry.getType().name());
+			o.addProperty("identifier", entry.getIdentifier());
+			arr.add(o);
+		}
+		return arr;
+	}
+
+	/**
+	 * A canvas point over the actor's model for hovering. Must be called on the client thread.
+	 */
+	private Point actorHoverPoint(Actor actor)
+	{
+		Shape hull = actor.getConvexHull();
+		if (hull != null)
+		{
+			Rectangle b = hull.getBounds();
+			if (b.width > 0 && b.height > 0)
+			{
+				return new Point(b.x + b.width / 2, b.y + b.height / 2);
+			}
+		}
+		Polygon poly = actor.getCanvasTilePoly();
+		if (poly != null)
+		{
+			Rectangle b = poly.getBounds();
+			if (b.width > 0 && b.height > 0)
+			{
+				return new Point(b.x + b.width / 2, b.y + b.height / 2);
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * A canvas point over a scene object for hovering. Must be called on the client thread.
+	 */
+	private Point objectHoverPoint(TileObject obj)
+	{
+		Shape clickbox = obj.getClickbox();
+		if (clickbox != null)
+		{
+			Rectangle b = clickbox.getBounds();
+			if (b.width > 0 && b.height > 0)
+			{
+				return new Point(b.x + b.width / 2, b.y + b.height / 2);
+			}
+		}
+		net.runelite.api.Point p = obj.getCanvasLocation();
+		return p != null ? new Point(p.getX(), p.getY()) : null;
+	}
+
+	private NPC findNpc(JsonObject args)
+	{
+		Integer index = args.has("npcIndex") ? args.get("npcIndex").getAsInt() : null;
+		String name = args.has("npcName") ? args.get("npcName").getAsString().toLowerCase() : null;
+		if (index == null && name == null)
+		{
+			throw new IllegalArgumentException("Provide npcIndex or npcName");
+		}
+		WorldPoint me = client.getLocalPlayer() != null ? client.getLocalPlayer().getWorldLocation() : null;
+		NPC best = null;
+		int bestDistance = Integer.MAX_VALUE;
+		for (NPC npc : client.getNpcs())
+		{
+			if (npc == null)
+			{
+				continue;
+			}
+			if (index != null)
+			{
+				if (npc.getIndex() == index)
+				{
+					return npc;
+				}
+				continue;
+			}
+			String npcName = npc.getName();
+			if (npcName == null || !npcName.toLowerCase().contains(name))
+			{
+				continue;
+			}
+			int distance = me != null && npc.getWorldLocation() != null
+				? me.distanceTo(npc.getWorldLocation())
+				: 0;
+			if (distance < bestDistance)
+			{
+				best = npc;
+				bestDistance = distance;
+			}
+		}
+		return best;
+	}
+
+	private static String availableActions(String[] actions)
+	{
+		if (actions == null)
+		{
+			return "(none)";
+		}
+		StringBuilder sb = new StringBuilder();
+		for (String action : actions)
+		{
+			if (action != null)
+			{
+				if (sb.length() > 0)
+				{
+					sb.append(", ");
+				}
+				sb.append(action);
+			}
+		}
+		return sb.length() == 0 ? "(none)" : sb.toString();
+	}
+
+	private JsonElement getVar(JsonObject args) throws Exception
+	{
+		String type = args.get("type").getAsString();
+		int id = args.get("id").getAsInt();
+		return onClientThread(() ->
+		{
+			JsonObject o = new JsonObject();
+			o.addProperty("type", type);
+			o.addProperty("id", id);
+			switch (type)
+			{
+				case "varbit":
+					o.addProperty("value", client.getVarbitValue(id));
+					break;
+				case "varp":
+					o.addProperty("value", client.getVarpValue(id));
+					break;
+				case "varcint":
+					o.addProperty("value", client.getVarcIntValue(id));
+					break;
+				case "varcstr":
+					o.addProperty("value", client.getVarcStrValue(id));
+					break;
+				default:
+					throw new IllegalArgumentException("Unknown var type: " + type
+						+ " (use varbit, varp, varcint or varcstr)");
+			}
+			return o;
+		});
+	}
+
+	// --- dialogue ---
+
+	private JsonObject selectOption(JsonObject args) throws Exception
+	{
+		int option = args.get("option").getAsInt();
+		if (option < 1 || option > 9)
+		{
+			throw new IllegalArgumentException("Option must be 1-9");
+		}
+		String before = dialogueFingerprint();
+		typeChar((char) ('0' + option));
+		return textResult(waitDialogueChange(before));
+	}
+
+	private JsonObject enterInput(JsonObject args) throws Exception
+	{
+		String text = args.get("text").getAsString();
+		String before = dialogueFingerprint();
+		for (char c : text.toCharArray())
+		{
+			typeChar(c);
+		}
+		pressNamedKey("ENTER");
+		return textResult(waitDialogueChange(before));
+	}
+
+	private String dialogueFingerprint() throws Exception
+	{
+		return McpHttpServer.GSON.toJson(onClientThread(this::readDialogue));
+	}
+
+	/**
+	 * Poll the dialogue state until it differs from the given fingerprint, returning
+	 * as soon as it changes instead of sleeping a fixed game tick. Falls through
+	 * with the latest state after 2s so unchanged dialogues still return promptly.
+	 */
+	private JsonObject waitDialogueChange(String beforeFingerprint) throws Exception
+	{
+		long deadline = System.currentTimeMillis() + 2_000L;
+		JsonObject current = null;
+		while (System.currentTimeMillis() < deadline)
+		{
+			Thread.sleep(100);
+			current = onClientThread(this::readDialogue);
+			if (!McpHttpServer.GSON.toJson(current).equals(beforeFingerprint))
+			{
+				return current;
+			}
+		}
+		return current;
+	}
+
+	/**
+	 * Read whichever dialogue widget is currently up. Must be called on the client thread.
+	 */
+	private JsonObject readDialogue()
+	{
+		JsonObject o = new JsonObject();
+
+		Widget npcText = client.getWidget(InterfaceID.ChatLeft.TEXT);
+		if (visible(npcText))
+		{
+			o.addProperty("type", "npc");
+			Widget name = client.getWidget(InterfaceID.ChatLeft.NAME);
+			if (visible(name))
+			{
+				o.addProperty("speaker", name.getText());
+			}
+			o.addProperty("text", npcText.getText());
+			o.addProperty("canContinue", visible(client.getWidget(InterfaceID.ChatLeft.CONTINUE)));
+			return o;
+		}
+
+		Widget playerText = client.getWidget(InterfaceID.ChatRight.TEXT);
+		if (visible(playerText))
+		{
+			o.addProperty("type", "player");
+			Widget name = client.getWidget(InterfaceID.ChatRight.NAME);
+			if (visible(name))
+			{
+				o.addProperty("speaker", name.getText());
+			}
+			o.addProperty("text", playerText.getText());
+			o.addProperty("canContinue", visible(client.getWidget(InterfaceID.ChatRight.CONTINUE)));
+			return o;
+		}
+
+		Widget optionsWidget = client.getWidget(InterfaceID.Chatmenu.OPTIONS);
+		if (visible(optionsWidget))
+		{
+			o.addProperty("type", "options");
+			Widget[] children = optionsWidget.getDynamicChildren();
+			JsonArray options = new JsonArray();
+			int number = 0;
+			if (children != null)
+			{
+				for (Widget child : children)
+				{
+					if (child == null || child.getText() == null || child.getText().isEmpty())
+					{
+						continue;
+					}
+					if (number == 0)
+					{
+						// First text child is the title, e.g. "Select an Option"
+						o.addProperty("title", child.getText());
+					}
+					else
+					{
+						JsonObject opt = new JsonObject();
+						opt.addProperty("option", number);
+						opt.addProperty("text", child.getText());
+						options.add(opt);
+					}
+					number++;
+				}
+			}
+			o.add("options", options);
+			return o;
+		}
+
+		Widget message = client.getWidget(InterfaceID.Messagebox.TEXT);
+		if (visible(message))
+		{
+			o.addProperty("type", "message");
+			o.addProperty("text", message.getText());
+			o.addProperty("canContinue", visible(client.getWidget(InterfaceID.Messagebox.CONTINUE)));
+			return o;
+		}
+
+		Widget itemText = client.getWidget(InterfaceID.Objectbox.TEXT);
+		if (visible(itemText))
+		{
+			o.addProperty("type", "item");
+			o.addProperty("text", itemText.getText());
+			Widget item = client.getWidget(InterfaceID.Objectbox.ITEM);
+			if (visible(item) && item.getItemId() != -1)
+			{
+				o.addProperty("itemId", item.getItemId());
+			}
+			return o;
+		}
+
+		Widget inputPrompt = client.getWidget(InterfaceID.Chatbox.MES_TEXT);
+		if (visible(inputPrompt))
+		{
+			o.addProperty("type", "input");
+			o.addProperty("prompt", inputPrompt.getText());
+			Widget current = client.getWidget(InterfaceID.Chatbox.MES_TEXT2);
+			if (visible(current))
+			{
+				o.addProperty("current", current.getText());
+			}
+			return o;
+		}
+
+		o.addProperty("type", "none");
+		return o;
+	}
+
+	private static boolean visible(Widget w)
+	{
+		return w != null && !w.isHidden();
+	}
+
+	private JsonElement listProjectiles() throws Exception
+	{
+		return onClientThread(() ->
+		{
+			JsonArray arr = new JsonArray();
+			for (Projectile projectile : client.getProjectiles())
+			{
+				if (projectile == null)
+				{
+					continue;
+				}
+				JsonObject o = new JsonObject();
+				o.addProperty("projectileId", projectile.getId());
+				o.addProperty("remainingCycles", projectile.getRemainingCycles());
+				o.addProperty("startSceneX", projectile.getX1());
+				o.addProperty("startSceneY", projectile.getY1());
+				o.addProperty("slope", projectile.getSlope());
+				o.addProperty("endHeight", projectile.getEndHeight());
+				WorldPoint target = projectile.getTargetPoint();
+				if (target != null)
+				{
+					o.addProperty("targetX", target.getX());
+					o.addProperty("targetY", target.getY());
+					o.addProperty("targetPlane", target.getPlane());
+				}
+				Actor targetActor = projectile.getTargetActor();
+				if (targetActor != null)
+				{
+					o.addProperty("target", targetActor.getName());
+					o.addProperty("targetType", targetActor instanceof NPC ? "npc" : "player");
+				}
+				arr.add(o);
+			}
+			JsonObject result = new JsonObject();
+			result.addProperty("count", arr.size());
+			result.add("projectiles", arr);
+			return result;
+		});
+	}
+
+	private JsonElement listGroundItems(JsonObject args) throws Exception
+	{
+		String filter = args.has("nameFilter") ? args.get("nameFilter").getAsString().toLowerCase() : null;
+		int maxDistance = optInt(args, "maxDistance", Integer.MAX_VALUE);
+		int maxResults = optInt(args, "maxResults", 50);
+		return onClientThread(() ->
+		{
+			Scene scene = client.getScene();
+			if (scene == null)
+			{
+				throw new IllegalStateException("No scene is loaded");
+			}
+			WorldPoint me = client.getLocalPlayer() != null ? client.getLocalPlayer().getWorldLocation() : null;
+			int plane = client.getPlane();
+			Tile[][] tiles = scene.getTiles()[plane];
+			List<JsonObject> list = new ArrayList<>();
+			for (Tile[] column : tiles)
+			{
+				for (Tile tile : column)
+				{
+					if (tile == null || tile.getGroundItems() == null)
+					{
+						continue;
+					}
+					WorldPoint wp = tile.getWorldLocation();
+					int distance = me != null && wp != null ? me.distanceTo(wp) : -1;
+					if (distance >= 0 && distance > maxDistance)
+					{
+						continue;
+					}
+					for (TileItem item : tile.getGroundItems())
+					{
+						if (item == null)
+						{
+							continue;
+						}
+						ItemComposition composition = client.getItemDefinition(item.getId());
+						String name = composition != null ? composition.getName() : null;
+						if (filter != null && (name == null || !name.toLowerCase().contains(filter)))
+						{
+							continue;
+						}
+						JsonObject o = new JsonObject();
+						o.addProperty("itemId", item.getId());
+						if (name != null)
+						{
+							o.addProperty("name", name);
+						}
+						o.addProperty("quantity", item.getQuantity());
+						if (wp != null)
+						{
+							o.addProperty("worldX", wp.getX());
+							o.addProperty("worldY", wp.getY());
+							o.addProperty("plane", wp.getPlane());
+						}
+						if (distance >= 0)
+						{
+							o.addProperty("distance", distance);
+						}
+						list.add(o);
+					}
+				}
+			}
+			return actorListResult("items", list, maxResults);
+		});
+	}
+
+	private JsonElement getInventory(JsonObject args) throws Exception
+	{
+		int inventoryId = args.get("inventoryId").getAsInt();
+		boolean includeEmpty = args.has("includeEmpty") && args.get("includeEmpty").getAsBoolean();
+		return onClientThread(() ->
+		{
+			ItemContainer container = client.getItemContainer(inventoryId);
+			if (container == null)
+			{
+				throw new IllegalArgumentException("Item container " + inventoryId
+					+ " is not loaded; use list_inventories to see what exists");
+			}
+			Item[] items = container.getItems();
+			JsonArray slots = new JsonArray();
+			int nonEmpty = 0;
+			for (int slot = 0; slot < items.length; slot++)
+			{
+				Item item = items[slot];
+				boolean empty = item == null || item.getId() == -1;
+				if (empty && !includeEmpty)
+				{
+					continue;
+				}
+				JsonObject o = new JsonObject();
+				o.addProperty("slot", slot);
+				o.addProperty("itemId", empty ? -1 : item.getId());
+				o.addProperty("quantity", empty ? 0 : item.getQuantity());
+				if (!empty)
+				{
+					nonEmpty++;
+					ItemComposition composition = client.getItemDefinition(item.getId());
+					if (composition != null)
+					{
+						o.addProperty("name", composition.getName());
+					}
+				}
+				slots.add(o);
+			}
+			JsonObject result = new JsonObject();
+			result.addProperty("inventoryId", inventoryId);
+			result.addProperty("size", items.length);
+			result.addProperty("itemCount", nonEmpty);
+			result.add("items", slots);
+			return result;
+		});
+	}
+
+	private JsonElement listInventories() throws Exception
+	{
+		return onClientThread(() ->
+		{
+			JsonArray arr = new JsonArray();
+			for (ItemContainer container : client.getItemContainers())
+			{
+				if (container == null)
+				{
+					continue;
+				}
+				int nonEmpty = 0;
+				for (Item item : container.getItems())
+				{
+					if (item != null && item.getId() != -1)
+					{
+						nonEmpty++;
+					}
+				}
+				JsonObject o = new JsonObject();
+				o.addProperty("inventoryId", container.getId());
+				o.addProperty("size", container.size());
+				o.addProperty("itemCount", nonEmpty);
+				arr.add(o);
+			}
+			JsonObject result = new JsonObject();
+			result.addProperty("count", arr.size());
+			result.add("inventories", arr);
+			return result;
+		});
+	}
+
+	private JsonObject waitFor(JsonObject args) throws Exception
+	{
+		String condition = args.get("condition").getAsString();
+		long timeout = Math.min(optInt(args, "timeoutMs", 10_000), 60_000);
+		long start = System.currentTimeMillis();
+		long deadline = start + timeout;
+		while (true)
+		{
+			JsonObject state = onClientThread(() -> checkCondition(condition, args, start));
+			if (state.get("met").getAsBoolean() || System.currentTimeMillis() >= deadline)
+			{
+				state.addProperty("condition", condition);
+				state.addProperty("waitedMs", System.currentTimeMillis() - start);
+				return textResult(state);
+			}
+			Thread.sleep(100);
+		}
+	}
+
+	/**
+	 * Evaluate a wait_for condition. Must be called on the client thread.
+	 */
+	private JsonObject checkCondition(String condition, JsonObject args, long startMs)
+	{
+		JsonObject o = new JsonObject();
+		boolean met;
+		switch (condition)
+		{
+			case "idle":
+			{
+				Player local = client.getLocalPlayer();
+				met = local != null && local.getAnimation() == -1
+					&& local.getPoseAnimation() == local.getIdlePoseAnimation();
+				if (local != null)
+				{
+					o.addProperty("animation", local.getAnimation());
+					o.addProperty("poseAnimation", local.getPoseAnimation());
+				}
+				break;
+			}
+			case "at_tile":
+			{
+				int x = args.get("x").getAsInt();
+				int y = args.get("y").getAsInt();
+				int range = optInt(args, "range", 1);
+				Player local = client.getLocalPlayer();
+				WorldPoint wp = local != null ? local.getWorldLocation() : null;
+				int distance = wp != null ? wp.distanceTo(new WorldPoint(x, y, wp.getPlane())) : Integer.MAX_VALUE;
+				met = distance <= range;
+				o.addProperty("distance", distance);
+				break;
+			}
+			case "npc_dead":
+			{
+				NPC npc = findNpc(args);
+				met = npc == null || npc.isDead();
+				o.addProperty("despawned", npc == null);
+				if (npc != null && npc.getHealthRatio() > -1)
+				{
+					o.addProperty("healthRatio", npc.getHealthRatio());
+					o.addProperty("healthScale", npc.getHealthScale());
+				}
+				break;
+			}
+			case "dialogue":
+			{
+				JsonObject dialogue = readDialogue();
+				met = !"none".equals(dialogue.get("type").getAsString());
+				o.add("dialogue", dialogue);
+				break;
+			}
+			case "interface_open":
+			case "interface_closed":
+			{
+				int interfaceId = args.get("interfaceId").getAsInt();
+				boolean open = interfaceBounds(interfaceId) != null;
+				met = "interface_open".equals(condition) == open;
+				o.addProperty("open", open);
+				break;
+			}
+			case "chat_message":
+			{
+				String contains = args.get("textContains").getAsString().toLowerCase();
+				JsonObject history = recorder.chatHistory(
+					System.currentTimeMillis() - startMs, null, null, 100);
+				met = false;
+				for (JsonElement e : history.getAsJsonArray("events"))
+				{
+					String message = e.getAsJsonObject().get("message").getAsString();
+					if (message.toLowerCase().contains(contains))
+					{
+						met = true;
+						o.addProperty("message", message);
+						break;
+					}
+				}
+				break;
+			}
+			default:
+				throw new IllegalArgumentException("Unknown condition: " + condition
+					+ " (idle, at_tile, npc_dead, dialogue, interface_open, interface_closed, chat_message)");
+		}
+		o.addProperty("met", met);
+		return o;
+	}
+
+	private JsonElement getSkills() throws Exception
+	{
+		return onClientThread(() ->
+		{
+			JsonArray skills = new JsonArray();
+			for (Skill skill : Skill.values())
+			{
+				JsonObject o = new JsonObject();
+				o.addProperty("skill", skill.getName());
+				o.addProperty("level", client.getRealSkillLevel(skill));
+				o.addProperty("boostedLevel", client.getBoostedSkillLevel(skill));
+				o.addProperty("xp", client.getSkillExperience(skill));
+				skills.add(o);
+			}
+			JsonObject result = new JsonObject();
+			result.addProperty("totalLevel", client.getTotalLevel());
+			result.add("skills", skills);
+			return result;
+		});
+	}
+
+	private JsonElement listObjects(JsonObject args) throws Exception
+	{
+		String filter = args.has("nameFilter") ? args.get("nameFilter").getAsString().toLowerCase() : null;
+		Integer objectId = args.has("objectId") ? args.get("objectId").getAsInt() : null;
+		int maxDistance = optInt(args, "maxDistance", Integer.MAX_VALUE);
+		int maxResults = optInt(args, "maxResults", 50);
+		return onClientThread(() ->
+		{
+			Scene scene = client.getScene();
+			if (scene == null)
+			{
+				throw new IllegalStateException("No scene is loaded");
+			}
+			WorldPoint me = client.getLocalPlayer() != null ? client.getLocalPlayer().getWorldLocation() : null;
+			Tile[][] tiles = scene.getTiles()[client.getPlane()];
+			// Multi-tile GameObjects appear on every tile they cover; report each once
+			Set<GameObject> seen = new HashSet<>();
+			List<JsonObject> list = new ArrayList<>();
+			for (Tile[] column : tiles)
+			{
+				for (Tile tile : column)
+				{
+					if (tile == null)
+					{
+						continue;
+					}
+					GameObject[] gameObjects = tile.getGameObjects();
+					if (gameObjects != null)
+					{
+						for (GameObject go : gameObjects)
+						{
+							if (go == null || !seen.add(go))
+							{
+								continue;
+							}
+							JsonObject o = describeTileObject("game", go, me, filter, objectId, maxDistance);
+							if (o != null)
+							{
+								o.addProperty("orientation", go.getOrientation());
+								o.addProperty("orientationDegrees", go.getOrientation() * 360 / 2048);
+								o.addProperty("facing", facing(go.getOrientation()));
+								o.addProperty("sizeX", go.sizeX());
+								o.addProperty("sizeY", go.sizeY());
+								list.add(o);
+							}
+						}
+					}
+					WallObject wall = tile.getWallObject();
+					if (wall != null)
+					{
+						JsonObject o = describeTileObject("wall", wall, me, filter, objectId, maxDistance);
+						if (o != null)
+						{
+							o.addProperty("orientationA", wall.getOrientationA());
+							o.addProperty("orientationB", wall.getOrientationB());
+							list.add(o);
+						}
+					}
+					DecorativeObject deco = tile.getDecorativeObject();
+					if (deco != null)
+					{
+						JsonObject o = describeTileObject("decorative", deco, me, filter, objectId, maxDistance);
+						if (o != null)
+						{
+							list.add(o);
+						}
+					}
+					GroundObject ground = tile.getGroundObject();
+					if (ground != null)
+					{
+						JsonObject o = describeTileObject("ground", ground, me, filter, objectId, maxDistance);
+						if (o != null)
+						{
+							list.add(o);
+						}
+					}
+				}
+			}
+			return actorListResult("objects", list, maxResults);
+		});
+	}
+
+	/**
+	 * Base description of a scene object, or null when it fails the filters.
+	 * Must be called on the client thread.
+	 */
+	private JsonObject describeTileObject(String type, TileObject obj, WorldPoint me,
+		String lowercaseFilter, Integer objectId, int maxDistance)
+	{
+		if (objectId != null && obj.getId() != objectId)
+		{
+			return null;
+		}
+		ObjectComposition composition = client.getObjectDefinition(obj.getId());
+		String name = composition != null ? composition.getName() : null;
+		if (lowercaseFilter != null && (name == null || !name.toLowerCase().contains(lowercaseFilter)))
+		{
+			return null;
+		}
+		WorldPoint wp = obj.getWorldLocation();
+		int distance = me != null && wp != null ? me.distanceTo(wp) : -1;
+		if (distance >= 0 && distance > maxDistance)
+		{
+			return null;
+		}
+		JsonObject o = new JsonObject();
+		o.addProperty("type", type);
+		o.addProperty("objectId", obj.getId());
+		if (name != null && !"null".equals(name))
+		{
+			o.addProperty("name", name);
+		}
+		if (composition != null && composition.getActions() != null)
+		{
+			JsonArray actions = new JsonArray();
+			for (String action : composition.getActions())
+			{
+				if (action != null)
+				{
+					actions.add(action);
+				}
+			}
+			if (actions.size() > 0)
+			{
+				o.add("actions", actions);
+			}
+		}
+		if (wp != null)
+		{
+			o.addProperty("worldX", wp.getX());
+			o.addProperty("worldY", wp.getY());
+			o.addProperty("plane", wp.getPlane());
+		}
+		if (distance >= 0)
+		{
+			o.addProperty("distance", distance);
+		}
+		return o;
+	}
+
+	private static final String[] COMPASS = {"S", "SW", "W", "NW", "N", "NE", "E", "SE"};
+
+	/**
+	 * Convert a jagex angle unit orientation (0-2047, 0 = south, counter-clockwise) to a compass direction.
+	 */
+	private static String facing(int jau)
+	{
+		return COMPASS[((jau + 128) & 2047) / 256];
+	}
+
+	private JsonElement pickupItem(JsonObject args) throws Exception
+	{
+		int itemId = args.get("itemId").getAsInt();
+		int x = args.get("x").getAsInt();
+		int y = args.get("y").getAsInt();
+		Integer planeArg = args.has("plane") ? args.get("plane").getAsInt() : null;
+		return onClientThread(() ->
+		{
+			int plane = planeArg != null ? planeArg : client.getPlane();
+			LocalPoint lp = LocalPoint.fromWorld(client, new WorldPoint(x, y, plane));
+			if (lp == null)
+			{
+				throw new IllegalArgumentException("Tile " + x + "," + y + " is not in the loaded scene");
+			}
+			client.menuAction(lp.getSceneX(), lp.getSceneY(), MenuAction.GROUND_ITEM_THIRD_OPTION,
+				itemId, -1, "Take", "");
+			JsonObject result = new JsonObject();
+			result.addProperty("invoked", "Take");
+			result.addProperty("itemId", itemId);
+			result.addProperty("tile", x + "," + y + "," + plane);
+			result.addProperty("note", "Player may need to walk to the tile; check list_ground_items again to confirm pickup");
+			return result;
+		});
+	}
+
+	// --- actor helpers ---
+
+	private static boolean matchesName(String name, String lowercaseFilter)
+	{
+		return lowercaseFilter == null || (name != null && name.toLowerCase().contains(lowercaseFilter));
+	}
+
+	/**
+	 * Describe an actor, or null when it is farther than maxDistance.
+	 * Must be called on the client thread.
+	 */
+	private JsonObject describeActor(Actor actor, WorldPoint me, int maxDistance)
+	{
+		WorldPoint wp = actor.getWorldLocation();
+		int distance = me != null && wp != null ? me.distanceTo(wp) : -1;
+		if (distance >= 0 && distance > maxDistance)
+		{
+			return null;
+		}
+		JsonObject o = new JsonObject();
+		o.addProperty("name", actor.getName());
+		o.addProperty("combatLevel", actor.getCombatLevel());
+		if (wp != null)
+		{
+			o.addProperty("worldX", wp.getX());
+			o.addProperty("worldY", wp.getY());
+			o.addProperty("plane", wp.getPlane());
+		}
+		if (distance >= 0)
+		{
+			o.addProperty("distance", distance);
+		}
+		if (actor.getAnimation() != -1)
+		{
+			o.addProperty("animation", actor.getAnimation());
+		}
+		o.addProperty("poseAnimation", actor.getPoseAnimation());
+		o.addProperty("orientation", actor.getCurrentOrientation());
+		o.addProperty("facing", facing(actor.getCurrentOrientation()));
+		// Health bar is only populated while it is rendered (in/just after combat)
+		if (actor.getHealthRatio() > -1)
+		{
+			o.addProperty("healthRatio", actor.getHealthRatio());
+			o.addProperty("healthScale", actor.getHealthScale());
+			if (actor.getHealthScale() > 0)
+			{
+				o.addProperty("healthPercent", actor.getHealthRatio() * 100 / actor.getHealthScale());
+			}
+		}
+		if (actor.isDead())
+		{
+			o.addProperty("isDead", true);
+		}
+		Actor interacting = actor.getInteracting();
+		if (interacting != null)
+		{
+			o.addProperty("interacting", interacting.getName());
+			o.addProperty("interactingType", interacting instanceof NPC ? "npc" : "player");
+		}
+		JsonArray spotAnims = new JsonArray();
+		for (ActorSpotAnim spotAnim : actor.getSpotAnims())
+		{
+			spotAnims.add(spotAnim.getId());
+		}
+		if (spotAnims.size() > 0)
+		{
+			o.add("spotAnims", spotAnims);
+		}
+		LocalPoint lp = actor.getLocalLocation();
+		if (lp != null && wp != null)
+		{
+			net.runelite.api.Point p = Perspective.localToCanvas(client, lp, wp.getPlane());
+			if (p != null)
+			{
+				o.addProperty("canvasX", p.getX());
+				o.addProperty("canvasY", p.getY());
+			}
+		}
+		return o;
+	}
+
+	private static JsonObject actorListResult(String key, List<JsonObject> list, int maxResults)
+	{
+		list.sort(Comparator.comparingInt(o -> o.has("distance") ? o.get("distance").getAsInt() : Integer.MAX_VALUE));
+		JsonArray arr = new JsonArray();
+		for (int i = 0; i < list.size() && i < maxResults; i++)
+		{
+			arr.add(list.get(i));
+		}
+		JsonObject result = new JsonObject();
+		result.addProperty("count", list.size());
+		result.add(key, arr);
+		return result;
+	}
+
+	// --- widget helpers ---
+
+	/**
+	 * Union of the visible component bounds of an interface, or null if none.
+	 * Must be called on the client thread.
+	 */
+	private Rectangle interfaceBounds(int interfaceId)
+	{
+		Rectangle union = null;
+		int gap = 0;
+		for (int child = 0; child < MAX_COMPONENTS_PER_INTERFACE && gap < COMPONENT_SCAN_GAP; child++)
+		{
+			Widget w = client.getWidget(WidgetUtil.packComponentId(interfaceId, child));
+			if (w == null)
+			{
+				gap++;
+				continue;
+			}
+			gap = 0;
+			if (w.isHidden())
+			{
+				continue;
+			}
+			Rectangle b = w.getBounds();
+			if (b == null || b.width <= 0 || b.height <= 0)
+			{
+				continue;
+			}
+			union = union == null ? new Rectangle(b) : union.union(b);
+		}
+		return union;
+	}
+
+	private static Rectangle pad(Rectangle r, int padding)
+	{
+		return new Rectangle(r.x - padding, r.y - padding, r.width + padding * 2, r.height + padding * 2);
+	}
+
+	private Widget resolveWidget(JsonObject args, String idKey, String indexKey)
+	{
+		Widget w = client.getWidget(args.get(idKey).getAsInt());
+		if (w != null && args.has(indexKey))
+		{
+			w = w.getChild(args.get(indexKey).getAsInt());
+		}
+		return w;
+	}
+
+	private JsonObject describeWidget(Widget w, int depth, boolean includeHidden)
+	{
+		JsonObject o = new JsonObject();
+		o.addProperty("componentId", w.getId());
+		o.addProperty("interfaceId", WidgetUtil.componentToInterface(w.getId()));
+		o.addProperty("childId", WidgetUtil.componentToId(w.getId()));
+		if (w.getIndex() != -1)
+		{
+			o.addProperty("childIndex", w.getIndex());
+		}
+		o.addProperty("type", w.getType());
+		if (w.getContentType() != 0)
+		{
+			o.addProperty("contentType", w.getContentType());
+		}
+		Rectangle bounds = w.getBounds();
+		if (bounds != null)
+		{
+			JsonObject b = new JsonObject();
+			b.addProperty("x", bounds.x);
+			b.addProperty("y", bounds.y);
+			b.addProperty("width", bounds.width);
+			b.addProperty("height", bounds.height);
+			o.add("bounds", b);
+		}
+		o.addProperty("relativeX", w.getRelativeX());
+		o.addProperty("relativeY", w.getRelativeY());
+		o.addProperty("originalX", w.getOriginalX());
+		o.addProperty("originalY", w.getOriginalY());
+		o.addProperty("width", w.getWidth());
+		o.addProperty("height", w.getHeight());
+		o.addProperty("hidden", w.isHidden());
+		if (w.isSelfHidden())
+		{
+			o.addProperty("selfHidden", true);
+		}
+		String text = w.getText();
+		if (text != null && !text.isEmpty())
+		{
+			o.addProperty("text", text);
+			o.addProperty("textColor", String.format("%06x", w.getTextColor()));
+		}
+		String name = w.getName();
+		if (name != null && !name.isEmpty())
+		{
+			o.addProperty("name", name);
+		}
+		if (w.getOpacity() != 0)
+		{
+			o.addProperty("opacity", w.getOpacity());
+		}
+		if (w.getItemId() != -1)
+		{
+			o.addProperty("itemId", w.getItemId());
+			o.addProperty("itemQuantity", w.getItemQuantity());
+		}
+		if (w.getSpriteId() != -1)
+		{
+			o.addProperty("spriteId", w.getSpriteId());
+		}
+		if (w.getModelId() != -1)
+		{
+			o.addProperty("modelId", w.getModelId());
+		}
+		if (depth > 0)
+		{
+			Widget[] dynamic = w.getDynamicChildren();
+			if (dynamic != null && dynamic.length > 0)
+			{
+				JsonArray children = new JsonArray();
+				for (Widget child : dynamic)
+				{
+					if (child != null && (includeHidden || !child.isHidden()))
+					{
+						children.add(describeWidget(child, depth - 1, includeHidden));
+					}
+				}
+				o.add("dynamicChildren", children);
+			}
+			appendChildIds(o, "staticChildIds", w.getStaticChildren());
+			appendChildIds(o, "nestedChildIds", w.getNestedChildren());
+		}
+		return o;
+	}
+
+	private static void appendChildIds(JsonObject o, String key, Widget[] children)
+	{
+		if (children == null || children.length == 0)
+		{
+			return;
+		}
+		JsonArray ids = new JsonArray();
+		for (Widget child : children)
+		{
+			if (child != null)
+			{
+				ids.add(child.getId());
+			}
+		}
+		if (ids.size() > 0)
+		{
+			o.add(key, ids);
+		}
+	}
+
+	private static void enqueueChildren(Deque<Widget> queue, Widget[] children)
+	{
+		if (children == null)
+		{
+			return;
+		}
+		for (Widget child : children)
+		{
+			if (child != null)
+			{
+				queue.add(child);
+			}
+		}
+	}
+
+	private static JsonArray toArray(Set<Integer> values)
+	{
+		JsonArray arr = new JsonArray();
+		values.stream().sorted().forEach(arr::add);
+		return arr;
+	}
+
+	private Point resolvePoint(JsonObject args, String idKey, String indexKey, String xKey, String yKey) throws Exception
+	{
+		if (args.has(idKey))
+		{
+			Rectangle bounds = onClientThread(() ->
+			{
+				Widget w = resolveWidget(args, idKey, indexKey);
+				return w == null || w.isHidden() ? null : w.getBounds();
+			});
+			if (bounds == null || bounds.width <= 0 || bounds.height <= 0)
+			{
+				throw new IllegalArgumentException("Widget not found, hidden or has no bounds: "
+					+ describeId(args, idKey, indexKey));
+			}
+			return new Point(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+		}
+		if (args.has(xKey) && args.has(yKey))
+		{
+			return new Point(args.get(xKey).getAsInt(), args.get(yKey).getAsInt());
+		}
+		throw new IllegalArgumentException("Provide either " + idKey + " or " + xKey + "/" + yKey);
+	}
+
+	private static String describeId(JsonObject args, String idKey, String indexKey)
+	{
+		int id = args.get(idKey).getAsInt();
+		String s = (id >> 16) + "." + (id & 0xFFFF) + " (" + id + ")";
+		if (args.has(indexKey))
+		{
+			s += "[" + args.get(indexKey).getAsInt() + "]";
+		}
+		return s;
+	}
+
+	// --- input dispatch ---
+
+	private void clickAt(int x, int y, int button) throws Exception
+	{
+		dispatchMouse(MouseEvent.MOUSE_MOVED, x, y, MouseEvent.NOBUTTON, 0);
+		Thread.sleep(15);
+		dispatchMouse(MouseEvent.MOUSE_PRESSED, x, y, button, 1);
+		Thread.sleep(20);
+		dispatchMouse(MouseEvent.MOUSE_RELEASED, x, y, button, 1);
+		dispatchMouse(MouseEvent.MOUSE_CLICKED, x, y, button, 1);
+	}
+
+	private void dispatchMouse(int id, int x, int y, int button, int clickCount) throws Exception
+	{
+		Canvas canvas = client.getCanvas();
+		if (canvas == null)
+		{
+			throw new IllegalStateException("Client canvas is not available");
+		}
+		int modifiers = 0;
+		if (button != MouseEvent.NOBUTTON
+			&& (id == MouseEvent.MOUSE_PRESSED || id == MouseEvent.MOUSE_DRAGGED))
+		{
+			modifiers = InputEvent.getMaskForButton(button);
+		}
+		// MOUSE_DRAGGED carries the pressed button in the modifier mask, not the button field
+		int eventButton = id == MouseEvent.MOUSE_DRAGGED ? MouseEvent.NOBUTTON : button;
+		MouseEvent event = new MouseEvent(canvas, id, System.currentTimeMillis(), modifiers,
+			x, y, clickCount, false, eventButton);
+		SwingUtilities.invokeAndWait(() -> canvas.dispatchEvent(event));
+	}
+
+	private void typeChar(char c) throws Exception
+	{
+		int code = KeyEvent.getExtendedKeyCodeForChar(c);
+		dispatchKeyBatch(
+			keyEvent(KeyEvent.KEY_PRESSED, code, c),
+			keyEvent(KeyEvent.KEY_TYPED, KeyEvent.VK_UNDEFINED, c),
+			keyEvent(KeyEvent.KEY_RELEASED, code, c));
+		Thread.sleep(5);
+	}
+
+	private void pressNamedKey(String name) throws Exception
+	{
+		int keyCode;
+		char keyChar = KeyEvent.CHAR_UNDEFINED;
+		switch (name)
+		{
+			case "ENTER":
+				keyCode = KeyEvent.VK_ENTER;
+				keyChar = '\n';
+				break;
+			case "ESCAPE":
+			case "ESC":
+				keyCode = KeyEvent.VK_ESCAPE;
+				keyChar = (char) 27;
+				break;
+			case "SPACE":
+				keyCode = KeyEvent.VK_SPACE;
+				keyChar = ' ';
+				break;
+			case "TAB":
+				keyCode = KeyEvent.VK_TAB;
+				keyChar = '\t';
+				break;
+			case "BACKSPACE":
+				keyCode = KeyEvent.VK_BACK_SPACE;
+				keyChar = '\b';
+				break;
+			case "UP":
+				keyCode = KeyEvent.VK_UP;
+				break;
+			case "DOWN":
+				keyCode = KeyEvent.VK_DOWN;
+				break;
+			case "LEFT":
+				keyCode = KeyEvent.VK_LEFT;
+				break;
+			case "RIGHT":
+				keyCode = KeyEvent.VK_RIGHT;
+				break;
+			default:
+				if (name.matches("F([1-9]|1[0-2])"))
+				{
+					keyCode = KeyEvent.VK_F1 + Integer.parseInt(name.substring(1)) - 1;
+					break;
+				}
+				throw new IllegalArgumentException("Unknown key: " + name);
+		}
+		if (keyChar != KeyEvent.CHAR_UNDEFINED)
+		{
+			dispatchKeyBatch(
+				keyEvent(KeyEvent.KEY_PRESSED, keyCode, keyChar),
+				keyEvent(KeyEvent.KEY_TYPED, KeyEvent.VK_UNDEFINED, keyChar),
+				keyEvent(KeyEvent.KEY_RELEASED, keyCode, keyChar));
+		}
+		else
+		{
+			dispatchKeyBatch(
+				keyEvent(KeyEvent.KEY_PRESSED, keyCode, keyChar),
+				keyEvent(KeyEvent.KEY_RELEASED, keyCode, keyChar));
+		}
+	}
+
+	private KeyEvent keyEvent(int id, int keyCode, char keyChar)
+	{
+		Canvas canvas = client.getCanvas();
+		if (canvas == null)
+		{
+			throw new IllegalStateException("Client canvas is not available");
+		}
+		return new KeyEvent(canvas, id, System.currentTimeMillis(), 0, keyCode, keyChar);
+	}
+
+	private void dispatchKeyBatch(KeyEvent... events) throws Exception
+	{
+		Canvas canvas = client.getCanvas();
+		SwingUtilities.invokeAndWait(() ->
+		{
+			for (KeyEvent event : events)
+			{
+				canvas.dispatchEvent(event);
+			}
+		});
+	}
+
+	// --- capture ---
+
+	private BufferedImage captureFrame() throws Exception
+	{
+		CompletableFuture<Image> future = new CompletableFuture<>();
+		drawManager.requestNextFrameListener(future::complete);
+		Image image = future.get(FRAME_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+		if (image instanceof BufferedImage)
+		{
+			return (BufferedImage) image;
+		}
+		BufferedImage copy = new BufferedImage(image.getWidth(null), image.getHeight(null), BufferedImage.TYPE_INT_RGB);
+		Graphics2D g = copy.createGraphics();
+		g.drawImage(image, 0, 0, null);
+		g.dispose();
+		return copy;
+	}
+
+	private static String pngBase64(BufferedImage image) throws IOException
+	{
+		ByteArrayOutputStream out = new ByteArrayOutputStream();
+		ImageIO.write(image, "png", out);
+		return Base64.getEncoder().encodeToString(out.toByteArray());
+	}
+
+	// --- plumbing ---
+
+	private <T> T onClientThread(Supplier<T> supplier) throws Exception
+	{
+		AtomicReference<T> result = new AtomicReference<>();
+		AtomicReference<RuntimeException> error = new AtomicReference<>();
+		CountDownLatch latch = new CountDownLatch(1);
+		clientThread.invoke(() ->
+		{
+			try
+			{
+				result.set(supplier.get());
+			}
+			catch (RuntimeException e)
+			{
+				error.set(e);
+			}
+			finally
+			{
+				latch.countDown();
+			}
+		});
+		if (!latch.await(CLIENT_THREAD_TIMEOUT_MS, TimeUnit.MILLISECONDS))
+		{
+			throw new IllegalStateException("Timed out waiting for the client thread; is the client running?");
+		}
+		if (error.get() != null)
+		{
+			throw error.get();
+		}
+		return result.get();
+	}
+
+	private static JsonObject textResult(String text)
+	{
+		JsonObject item = new JsonObject();
+		item.addProperty("type", "text");
+		item.addProperty("text", text);
+		JsonArray content = new JsonArray();
+		content.add(item);
+		JsonObject result = new JsonObject();
+		result.add("content", content);
+		return result;
+	}
+
+	private static JsonObject textResult(JsonElement json)
+	{
+		return textResult(McpHttpServer.GSON.toJson(json));
+	}
+
+	private static int optInt(JsonObject args, String key, int def)
+	{
+		return args.has(key) ? args.get(key).getAsInt() : def;
+	}
+
+	private static JsonObject tool(String name, String description, JsonObject inputSchema)
+	{
+		JsonObject o = new JsonObject();
+		o.addProperty("name", name);
+		o.addProperty("description", description);
+		o.add("inputSchema", inputSchema);
+		return o;
+	}
+
+	private static JsonObject schema(JsonObject properties, String... required)
+	{
+		JsonObject o = new JsonObject();
+		o.addProperty("type", "object");
+		o.add("properties", properties);
+		if (required.length > 0)
+		{
+			JsonArray req = new JsonArray();
+			for (String r : required)
+			{
+				req.add(r);
+			}
+			o.add("required", req);
+		}
+		return o;
+	}
+
+	private static JsonObject prop(String type, String description)
+	{
+		JsonObject o = new JsonObject();
+		o.addProperty("type", type);
+		o.addProperty("description", description);
+		return o;
+	}
+}
