@@ -20,7 +20,9 @@ java {
 // Override the path with -PfluxClientJar=...
 val fluxClientJar = providers.gradleProperty("fluxClientJar")
     .getOrElse("D:/RSPS/Fluxious/FluxRSClient/runelite-client/build/libs/runelite-client-shaded.jar")
-val useLocalClient = file(fluxClientJar).exists()
+// java.io.File, not Gradle file(): on Linux CI the default Windows path
+// ("D:/...") would be parsed as a URL and fail the build
+val useLocalClient = File(fluxClientJar).exists()
 
 repositories {
     if (!useLocalClient) {
