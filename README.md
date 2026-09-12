@@ -31,6 +31,17 @@ then connect Claude:
 claude mcp add --transport http flux http://127.0.0.1:7780/mcp
 ```
 
+The AI calls these tools constantly — skip per-call permission prompts by allowing
+the whole server in your project's `.claude/settings.local.json`:
+
+```json
+{
+	"permissions": {
+		"allow": ["mcp__flux"]
+	}
+}
+```
+
 ## Dashboard
 
 While the plugin is running, `http://127.0.0.1:7780/` serves a live activity
