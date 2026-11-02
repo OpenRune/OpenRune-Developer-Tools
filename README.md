@@ -10,23 +10,25 @@ screenshots.
 ## Build and deploy
 
 ```
-gradlew jar
+gradlew build   # compile + run the unit/transport test suite, no side effects
+gradlew jar     # build the plugin jar only
+gradlew deploy  # build and copy the jar into every detected client's sideloaded-plugins folder
 ```
 
-That is the whole setup. The jar deploys itself to every client on your
-machine, by looking for the `sideloaded-plugins` folder each one creates in your
-home directory — `~/.runelite`, `~/.rsprox`, `~/.fluxious`, or a fork's own
-directory, with nothing to configure. The build prints where it deployed.
+Deployment is a separate, explicit task: building or testing never touches
+installed clients. `deploy` looks for the `sideloaded-plugins` folder each
+client creates in your home directory — `~/.runelite`, `~/.rsprox`,
+`~/.fluxious`, or a fork's own directory — and prints where it deployed.
 
 Deploying fails if one of those clients is running, because it holds its jar
 open. The other clients are still updated and the error names the ones that
 were not. A client only loads a new jar when it starts, so restart it after
-building.
+deploying.
 
 Two optional flags, for cases the default doesn't cover:
 
 ```
-gradlew jar -PsideloadDirs=.runelite,.myclient   # deploy to exactly these
+gradlew deploy -PsideloadDirs=.runelite,.myclient   # deploy to exactly these
 gradlew jar -PclientJar=/path/to/client-shaded.jar   # compile against a client's jar
 ```
 
@@ -39,6 +41,12 @@ then connect Claude:
 ```
 claude mcp add --transport http flux http://127.0.0.1:7780/mcp
 ```
+
+The server binds to the loopback interface only and refuses browser cross-origin
+POSTs (an `Origin` header that is not loopback is rejected), so a web page cannot
+drive your client. Request bodies are capped at 2 MiB. It is still an
+unauthenticated local control surface — treat anything that can POST to
+localhost as able to act in game.
 
 The AI calls these tools constantly — skip per-call permission prompts by allowing
 the whole server in your project's `.claude/settings.local.json`:
@@ -73,7 +81,9 @@ the last 100 calls in memory, so refreshing the page replays recent history.
 ## Releases
 
 Pushing to the `prod` branch builds the jar and publishes a GitHub release
-automatically.
+automatically. The in-plugin update check only announces that a newer release
+exists on this fork (in chat and the logs); it never downloads or installs
+anything by itself.
 
 ## Tools
 
@@ -88,6 +98,9 @@ automatically.
 | `get_widget_at` | Deepest visible widget at a canvas pixel, with parent chain |
 | `set_widget` | Live-edit a widget client-side: move, resize, hide, retext, recolor, then revalidate |
 | `get_client_state` | Game state, canvas size, mouse, player position/region, energy, weight, camera, menu-open flag |
+| `get_status` | Server + session status: plugin version, tool count, fps, game state, tick, position, active markers — check this first when a tool behaves oddly |
+| `observe` | One client-thread pass: vitals, boosts, combat, inventory (with item ops), nearest NPCs/objects/ground items, dialogue. Optional `sections`: equipment, skills, players, projectiles |
+| `get_combat_state` | Cheap combat poll: in-combat flag (Idle Notifier timing), attackers, target, active prayers, ticks since last hit dealt/received |
 | `get_skills` | All skills: level, boosted level, xp, total level |
 
 ### Raw input
@@ -114,6 +127,8 @@ automatically.
 | `list_projectiles` | Projectiles in flight with target info |
 | `get_inventory` | Any item container by id (93 inventory, 94 worn, 95 bank, custom) with slots/names/quantities |
 | `list_inventories` | All loaded item containers |
+| `get_actor` | Deep inspect one actor (npcIndex/npcName/playerName): animations, facing, health, overhead text, target, spot anims, canvas pos, NPC id/transform state |
+| `get_tile` | One world tile fully: all object kinds with actions, ground items, collision flags, walkability — precise alternative to list_* when the tile is known |
 
 ### Interaction (one call, no screenshots)
 
@@ -122,11 +137,128 @@ automatically.
 | `interact_npc` | Invoke a cache-defined NPC option (default Talk-to) |
 | `get_npc_menu` | Hover an NPC and read its live right-click menu, incl. server-added options |
 | `click_menu_option` | Click an entry of the currently built mini-menu |
-| `item_action` | Right-click an inventory item and click an option (Drop, Eat, Wield...) |
+| `item_action` | Invoke an item's own inventory op (Drop, Eat, Wield...) — works with the inventory tab closed |
 | `interact_object` | Nearest matching object, hover, click option (Chop down, Mine, Open...) |
+| `object_action` | Invoke a scene object's op directly by objectId + world x/y — object need not be on screen, mouse never moves |
 | `interact_player` | Hover a player and click an option (Trade with, Follow...) |
 | `widget_action` | Right-click any widget and click a menu option (spells, prayers, buttons) |
+| `widget_op` | Invoke a named widget action directly — resolve `componentId` (+optional `childIndex`), find `option` in its actions list (or `opIndex`), fire CC_OP. No mouse, works for any actioned widget |
+| `set_prayer` | Toggle a prayer by name (exact Prayer enum name or fuzzy prayer-book label) via the real prayer-book widget |
 | `invoke_menu_action` | Raw `menuAction` escape hatch with explicit params |
+| `get_menu` | The currently built menu entries with option/target/type/params — inspect before `click_menu_option`, or get real packet fields for `invoke_menu_action` |
+| `use_item` | Use an inventory item on a target (NPC, object, player, another item) — invokes `Use` then the target's `Use item -> target` entry, the same two packets a player sends |
+
+### Economy
+
+| Tool | Description |
+|---|---|
+| `list_shop` | Open shop's stock: slot, itemId, name, stock quantity, per-slot ops (Buy/Value) |
+| `shop_action` | Invoke a shop op directly on a stock item (Buy 1/5/10/50, Value) or an inventory item (`side:"inventory"`, Sell ops) |
+| `get_trade` | Trade screen state: stage (offer/confirm/none), your offer, every item rendered on the trade screen |
+| `trade_action` | `action:"accept"/"decline"` (works on both screens), or offer/remove ops on items via `option` + `side` |
+
+### Session and progression
+
+| Tool | Description |
+|---|---|
+| `list_worlds` | Loaded world list: id, players, activity, location, types, current flag |
+| `hop_world` | Hop to a world id — pair with `wait_for world` or a login-state check |
+| `logout` | Invoke the Logout button on the logout tab interface (must be loaded) |
+| `list_quests` | Every known quest with state NOT_STARTED/IN_PROGRESS/FINISHED; filter by name or state |
+
+### Definitions
+
+| Tool | Description |
+|---|---|
+| `item_def` | Item cache definition: name, note/placeholder links, stackable, members, tradeable, price, inventory ops; optional `param` resolves one item param key |
+| `npc_def` | NPC cache definition: name, combat level, actions, size, transform ids |
+| `object_def` | Object cache definition: name, actions, size, impostor/transform ids (varbit-driven forms) |
+| `enum_def` | EnumComposition dump: enum id → key/value rows (ints or strings) |
+| `struct_def` | StructComposition dump: struct id → param keys, resolved values for given keys |
+| `anim_def` | Animation definition: frames, duration, per-frame lengths, forced hand items |
+| `db_table` | DBTable cache: list rows by table, dump a row's fields, or query rows by column value |
+
+### Social
+
+| Tool | Description |
+|---|---|
+| `get_clan` | Clan channel info: own + guest channel names, members (name, rank, world) |
+| `get_fc` | Friends chat: owner, channel name, your rank, kick rank, members (name, world, rank) |
+| `list_friends` | Friends list: name + world |
+| `list_ignore` | Ignore list: names + previous names |
+
+### Navigation markers
+
+| Tool | Description |
+|---|---|
+| `get_hint_arrow` | Current hint arrow (server-set navigation marker): type + target tile/NPC/player |
+| `set_hint_arrow` | Client-side hint arrow on a tile, NPC or player |
+| `clear_hint_arrow` | Clear the hint arrow |
+
+### Misc
+
+| Tool | Description |
+|---|---|
+| `examine` | Send an Examine packet (NPC, object, ground item, inventory item) — server replies via chat; pair with `wait_for chat_message` |
+| `list_vars` | Bulk var dump: varps (with `serverValue`) or varcs in an id range |
+| `list_gfx` | Live unattached graphics objects (ground spotanims / AoE telegraphs) |
+| `list_ge_offers` | Grand Exchange offer slots (empty on servers without GE) |
+| `get_instance_map` | Instanced region layout: chunk template grid with source region + rotation |
+| `item_sprite` | Render an item's inventory icon as a PNG image |
+| `get_music` | Active MIDI requests (track archive ids + jingle flag) and music volume |
+
+### Decision loop (observe → pick → act)
+
+| Tool | Description |
+|---|---|
+| `list_actions` | Everything actionable right now as a numbered menu — dialogue answers, NPC ops, object ops, ground-item takes, item ops — each with the tool + args that would run it |
+| `act` | Execute one menu entry by `id`. Rejects ids from menus older than `maxAgeTicks` (default 3) and revalidates the target (NPC still there and same id, item still on the tile, dialogue still open) before dispatch |
+
+`list_actions` answers "what can I do here" in one call instead of an agent
+guessing targets. Actors that target the local player are flagged `targetsMe`
+in `observe`/`list_npcs`, and NPCs carry `interactingIndex` when their target
+can be resolved. Destructive or two-target ops (drop, destroy, use) are never
+listed — use `item_action`/`invoke_menu_action` for those deliberately.
+
+### Evidence and regression
+
+| Tool | Description |
+|---|---|
+| `snapshot_state` | Store a labelled state snapshot (vitals, combat, inventory, equipment, skills, entities) |
+| `diff_state` | Diff live state against a stored snapshot — returns only changed fields |
+| `run_batch` | Execute an ordered list of tool calls in one request, per-step ok/error |
+| `compare_screenshot` | Store a screenshot region as a labelled baseline, then diff later captures — `changedPixels`, `changedPct`, `diffBounds`, `thresholdPct` pass/fail |
+| `get_spawn_history` | NPC spawn/despawn/transform events — boss phase changes, respawn verification |
+| `get_loot_history` | Ground-item spawned/despawned events — deterministic drop-table evidence |
+| `get_overhead_history` | NPC/player overhead text events — phase-change announcements |
+| `get_interface_history` | Interface group opened/closed/unloaded events — proves the server opened a screen |
+| `get_action_history` | Audit trail of menu options the client invoked (option, target, MenuAction type, params) — what the server actually received |
+| `get_object_history` | Scene object lifecycle: spawned/despawned for game/wall/decorative/ground objects — arena objects, toggling doors |
+| `get_gfx_history` | Unattached graphics object spawns (ground spotanims — AoE telegraphs) |
+| `get_interact_history` | Actor target changes: who targeted/cleared whom — tank swaps, retargets |
+| `get_social_history` | Clan channel + friends chat join/leave/member events |
+| `get_world_history` | world_changed + mapload (instanced region loads) events |
+
+### Combat extras
+
+| Tool | Description |
+|---|---|
+| `get_special_attack` / `toggle_special_attack` | Spec energy + enabled state; click the spec orb |
+| `get_attack_style` / `set_attack_style` | Read/click combat-tab attack styles by name or index |
+| `list_spells` / `cast_spell` | Spellbook contents; cast a spell by fuzzy name |
+| `bank_action` | Withdraw/deposit ops directly on bank widgets while the bank is open |
+| `toggle_run` | Click the run orb; returns energy and run state (`VarPlayerID.OPTION_RUN`) |
+
+### World extras
+
+| Tool | Description |
+|---|---|
+| `is_walkable` | Collision flags for a world tile — "did the door actually block" |
+| `get_destination` | The tile the player is currently walking to |
+| `search_interfaces` | Find loaded widgets containing a text string |
+| `find_path` | BFS pathfind over the loaded collision map — is a tile reachable, plus the exact tile path |
+| `get_collision_area` | Raw collision-flag grid for a rectangle of the scene, with a walkable map |
+| `set_camera` | Set camera yaw/pitch targets for deterministic screenshots |
 
 ### Dialogue
 
@@ -143,7 +275,16 @@ automatically.
 |---|---|
 | `get_script_history` | Clientscripts fired recently: per-script counts + events with tick and args |
 | `get_var_history` | Varbit/varp/varc changes with old/new values, tick, timestamp |
-| `get_var` | Current value of a varbit, varp, varc int or varc string |
+| `get_var` | Current value of a varbit, varp, varc int or varc string; varp/varbit also report `serverValue` — the last value the server sent, so client-side overrides are visible |
+| `set_var` | Write a varp/varbit/varcint/varcstr client-side (UI/state testing). Server overwrites it on next sync — compare with `get_var.serverValue` |
+
+### Markers (visual aid for humans watching the client)
+
+| Tool | Description |
+|---|---|
+| `mark_tile` | Highlight a world tile in-scene (outline + fill) with optional label/colour/tick expiry — shows what an agent is pointing at |
+| `mark_widget` | Draw a rectangle around a widget/component so a human can see which component is being referenced |
+| `clear_marks` | Remove one marker by name, or all |
 | `get_projectile_history` | Projectiles launched recently, one entry each, with values and target |
 | `get_effect_history` | Animations and graphics played by NPCs/players recently |
 | `get_chat_history` | Chatbox messages: type, sender, message, tick, timestamp |
@@ -156,10 +297,13 @@ automatically.
 
 | Tool | Description |
 |---|---|
-| `get_timeline` | Every channel merged into one tick-ordered stream — scripts, vars, projectiles, effects, chat, combat, experience, containers, sounds. Scripts are left out unless requested. Filter by `channels`, `fromTick`/`toTick` |
+| `get_timeline` | Every channel merged into one tick-ordered stream — vars, projectiles, effects, chat, combat, experience, containers, sounds, interfaces, actions, spawns, loot, overheads. Scripts are left out unless requested. Filter by `channels`, `fromTick`/`toTick` |
 
 ### Waiting
 
 | Tool | Description |
 |---|---|
-| `wait_for` | Block until a condition: idle, at_tile, npc_dead, dialogue, interface_open/closed, chat_message — checked every 100ms, returns immediately when met |
+| `wait_for` | Block until a condition: idle, at_tile, npc_dead, dialogue, interface_open/closed, chat_message, hitsplat, projectile, animation, spotanim, var (exact value, or omit `value` for any change), stat (level change), menu (menu open), game_state, object_spawn/despawn, interacting (target change), gfx (ground graphic), hintarrow, in_combat/out_of_combat, prayer, ticks, spawn/despawn/transform, loot, overhead, xp, container, action, world — checked every 100ms via an early-exit event scan, returns immediately when met. Event-based conditions only see new events after the call starts |
+
+All history tools report a `dropped` count — how many events were evicted from
+the bounded buffer — so truncation is visible instead of silent.
